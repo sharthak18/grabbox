@@ -59,6 +59,9 @@ class Handler(BaseHTTPRequestHandler):
                              "GET, POST, OPTIONS")
             self.send_header("Vary", "Origin")
 
+    # Set by do_HEAD around a do_GET call so _send skips the body write.
+    _head_only = False
+
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode("utf-8")
@@ -70,6 +73,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self._cors()
         self.end_headers()
+        if self._head_only:
+            return
         try:
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
@@ -94,6 +99,16 @@ class Handler(BaseHTTPRequestHandler):
         self._cors()
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def do_HEAD(self):
+        # BaseHTTPRequestHandler does not implement HEAD. Treat it like GET
+        # but swallow the body - that way static file headers (Content-Type,
+        # Content-Length) and API CORS pre-flight HEAD probes both work.
+        self._head_only = True
+        try:
+            self.do_GET()
+        finally:
+            self._head_only = False
 
     # --------------------------------------------------------------- routing
 
@@ -166,7 +181,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": ok})
 
         if path == "/api/config":
+            prev_conc = int(self.config.get("concurrency", 2))
             self.config.update(body)
+            new_conc = int(self.config.get("concurrency", 2))
+            # If concurrency changed, rebuild the manager's semaphore so the
+            # new limit takes effect for subsequent jobs.
+            if new_conc != prev_conc and self.manager is not None:
+                self.manager.set_concurrency(new_conc)
             if body.get("watch_clipboard"):
                 self.watcher.start()
             elif "watch_clipboard" in body:
@@ -240,15 +261,43 @@ def serve(host="127.0.0.1", port=None, open_browser=None, verbose=False,
     config = config or Config()
     port = int(port or config.get("port") or 8765)
 
-    Handler.manager = downloader.Manager(config)
+    manager = downloader.Manager(config)
+    Handler.manager = manager
     Handler.config = config
     Handler.watcher = clipboard.Watcher()
     if config.get("watch_clipboard"):
         Handler.watcher.start()
 
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    # If the requested port is in use, fall back to a free one instead of
+    # crashing — that's what double-clicking the launcher twice expects.
+    httpd = None
+    last_err = None
+    for attempt_port in (port,):
+        try:
+            httpd = ThreadingHTTPServer((host, attempt_port), Handler)
+            port = attempt_port
+            break
+        except OSError as e:
+            last_err = e
+    if httpd is None:
+        chosen = None
+        for fallback in range(port + 1, port + 50):
+            try:
+                httpd = ThreadingHTTPServer((host, fallback), Handler)
+                port = fallback
+                chosen = True
+                break
+            except OSError as e:
+                last_err = e
+        if not chosen:
+            sys.stderr.write(
+                "Could not bind to %s:%s (%s) and no nearby port was free.\n"
+                % (host, port, last_err))
+            return 1
     httpd.daemon_threads = True
     httpd.verbose = verbose
+    # Remember the port we actually ended up on so config reflects reality.
+    config.set("port", port)
 
     url = "http://%s:%d/" % ("127.0.0.1" if host in ("0.0.0.0", "") else host, port)
     print("GrabBox %s  ->  %s" % (__version__, url))

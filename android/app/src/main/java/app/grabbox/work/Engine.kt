@@ -155,7 +155,7 @@ object Engine {
             "tv client (no PO token needed)" to
                 listOf("--extractor-args", "youtube:player_client=tv"),
             "skip android clients, add web_safari" to
-                listOf("--extractor-args", "youtube:player_client=default,-android_vr,web_safari"),
+                listOf("--extractor-args", "youtube:player_client=-android_vr,web_safari"),
             "web_embedded + web + tv" to
                 listOf("--extractor-args", "youtube:player_client=web_embedded,web,tv"),
             "IPv4 only, tv client" to
@@ -172,8 +172,9 @@ object Engine {
         filename: String?,
         rungArgs: List<String>,
     ): YoutubeDLRequest {
+        val safe = if (!filename.isNullOrBlank()) sanitizeFilename(filename) else ""
         val template = when {
-            !filename.isNullOrBlank() -> sanitizeFilename(filename) + ".%(ext)s"
+            safe.isNotBlank() -> if (looksLikeFinalName(safe, kind)) safe else "$safe.%(ext)s"
             playlist -> "%(playlist_index)02d - %(title)s.%(ext)s"
             else -> "%(title)s.%(ext)s"
         }
@@ -199,7 +200,11 @@ object Engine {
             "audio" -> {
                 request.addOption("-f", "bestaudio/best")
                 request.addOption("-x")
-                request.addOption("--audio-format", quality)
+                // "best" = original stream, no re-encode (don't pass --audio-format,
+                // since "best" isn't a real format and yt-dlp would error).
+                if (quality != "best" && quality != "original") {
+                    request.addOption("--audio-format", quality)
+                }
                 if (quality == "mp3") request.addOption("--audio-quality", "0")
                 request.addOption("--embed-thumbnail")
             }
@@ -272,6 +277,28 @@ object Engine {
             .joinToString("")
             .trim()
             .replace(Regex("\\s+"), " ")
+    }
+
+    private fun looksLikeFinalName(name: String, kind: String): Boolean {
+        val ext = name.substringAfterLast('.', "").lowercase()
+        if (ext.isBlank()) return false
+        val audio = setOf("mp3", "m4a", "aac", "opus", "ogg", "oga", "flac", "wav", "wma", "aiff")
+        val video = setOf("mp4", "mkv", "webm", "mov", "avi", "m4v", "flv", "ts", "mpg",
+            "mpeg", "3gp", "wmv")
+        val file = mutableSetOf<String>().apply {
+            addAll(audio); addAll(video)
+            addAll(listOf("jpg", "jpeg", "png", "gif", "webp", "bmp", "svg",
+                "avif", "tif", "tiff", "ico", "heic", "exe", "msi", "apk", "dmg", "pkg", "deb",
+                "rpm", "appimage", "jar", "ipa", "zip", "rar", "7z", "tar", "gz", "tgz", "bz2",
+                "xz", "zst", "iso", "img", "pdf", "epub", "mobi", "txt", "md", "csv", "json",
+                "xml", "srt", "vtt"))
+        }
+        return when (kind) {
+            "audio" -> ext in audio
+            "video" -> ext in video
+            "file" -> ext in file
+            else -> ext in file
+        }
     }
 
     /** Default download home: the shared Downloads folder, GrabBox subdir. */

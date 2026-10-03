@@ -425,18 +425,29 @@ async function startDownload() {
 /* --------------------------------------------------------------- jobs --- */
 
 let lastJobState = "";
+let jobsScheduled = false;
 const notified = new Set();
 
 async function refreshJobs(force) {
+  // Coalesce rapid calls into one animation-frame paint to keep 60fps even
+  // when many jobs update at once or the poll fires while a render is pending.
+  if (!force && jobsScheduled) return;
+  jobsScheduled = true;
+  await new Promise((r) => requestAnimationFrame(r));
+  jobsScheduled = false;
   let data;
   try { data = await driver.jobs(); } catch (e) { return; }
   const jobs = (data.jobs || []).slice().reverse();
-  const key = JSON.stringify(jobs.map((j) => [j.id, j.status, j.percent, j.filename, j.attempt]));
+  const key = JSON.stringify(jobs.map((j) => [j.id, j.status, Math.round(j.percent*10)/10, j.filename, j.attempt, j.items_done, j.items_total]));
   if (!force && key === lastJobState) return;
   const hadRunning = lastJobState.includes('"running"');
   lastJobState = key;
 
   const box = $("#jobs");
+  // Preserve focus if a button inside the box is currently active, so cancel
+  // clicks don't get eaten by a re-render mid-click.
+  const activeId = document.activeElement && document.activeElement.dataset
+    && document.activeElement.dataset.cancel;
   if (!jobs.length) {
     box.innerHTML = `<div class="empty">Nothing downloading yet.<br>Paste a link above — it shows up here with live progress.</div>`;
   } else {
@@ -447,6 +458,10 @@ async function refreshJobs(force) {
       on(b, "click", () => driver.fileAction(b.dataset.show, "reveal")));
     box.querySelectorAll("[data-play]").forEach((b) =>
       on(b, "click", () => driver.fileAction(b.dataset.play, "open")));
+    if (activeId) {
+      const btn = box.querySelector(`[data-cancel="${activeId}"]`);
+      if (btn) btn.focus();
+    }
   }
   jobs.forEach((j) => {
     if (j.status === "done" && !notified.has(j.id)) {
@@ -459,24 +474,25 @@ async function refreshJobs(force) {
 
 function jobCard(j) {
   const cls = j.status === "done" ? "done" : (j.status === "error" || j.status === "canceled") ? "error" : "";
-  const pct = j.percent ? `${j.percent.toFixed(0)}%` : "";
+  const pct = j.percent ? `${Math.max(0, Math.min(100, j.percent)).toFixed(0)}%` : "";
   const parts = [];
   if (j.speed) parts.push(`${fmtBytes(j.speed)}/s`);
-  if (j.eta) parts.push(`${j.eta}s left`);
+  if (j.eta) parts.push(`${Math.round(j.eta)}s left`);
   if (j.items_total) parts.push(`item ${j.items_done || 1}/${j.items_total}`);
   if (j.attempts_total > 1) parts.push(`attempt ${j.attempt}/${j.attempts_total}`);
+  const w = Math.max(0, Math.min(100, j.percent || 0));
   return `
   <div class="job ${cls}">
     <div class="job-top">
       <div class="job-title" title="${escapeAttr(j.filename || j.title || j.url)}">${escapeHtml(j.filename || j.title || j.url)}</div>
       <div class="job-actions">
-        ${j.status === "running" || j.status === "queued" ? `<button class="icon-btn" data-cancel="${j.id}" title="Stop"><svg><use href="#i-close"/></svg></button>` : ""}
-        ${j.status === "done" && j.path ? `<button class="icon-btn" data-play="${escapeAttr(j.path)}" title="Play / open"><svg><use href="#i-play"/></svg></button>
-          <button class="icon-btn" data-show="${escapeAttr(j.path)}" title="Show in folder"><svg><use href="#i-folder"/></svg></button>` : ""}
+        ${j.status === "running" || j.status === "queued" ? `<button class="icon-btn" data-cancel="${j.id}" title="Stop" aria-label="Stop"><svg><use href="#i-close"/></svg></button>` : ""}
+        ${j.status === "done" && j.path ? `<button class="icon-btn" data-play="${escapeAttr(j.path)}" title="Play / open" aria-label="Open"><svg><use href="#i-play"/></svg></button>
+          <button class="icon-btn" data-show="${escapeAttr(j.path)}" title="Show in folder" aria-label="Show in folder"><svg><use href="#i-folder"/></svg></button>` : ""}
       </div>
     </div>
     <div class="job-sub"><span class="job-status">${j.status}</span>${pct ? " · " + pct : ""}${parts.length ? " · " + parts.join(" · ") : ""}</div>
-    <div class="bar"><i style="width:${j.percent || 0}%"></i></div>
+    <div class="bar"><i style="width:${w}%"></i></div>
     ${j.status === "error" && j.error ? `<div class="err">${escapeHtml(j.error)}</div>` : ""}
     ${j.hint ? `<div class="hint">💡 ${escapeHtml(j.hint)}</div>` : ""}
   </div>`;

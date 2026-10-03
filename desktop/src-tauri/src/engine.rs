@@ -397,7 +397,7 @@ impl Engine {
                 "skip android clients, add web_safari".into(),
                 vec![
                     "--extractor-args".into(),
-                    "youtube:player_client=default,-android_vr,web_safari".into(),
+                    "youtube:player_client=-android_vr,web_safari".into(),
                 ],
             ),
             (
@@ -457,7 +457,12 @@ impl Engine {
         }
 
         let outtmpl = if let Some(name) = filename.filter(|s| !s.is_empty()) {
-            format!("{}.%(ext)s", sanitize_filename(name))
+            let safe = sanitize_filename(name);
+            if looks_like_final_name(&safe, kind) {
+                safe
+            } else {
+                format!("{}.%(ext)s", safe)
+            }
         } else if playlist {
             "%(playlist_index)02d - %(title)s.%(ext)s".to_string()
         } else {
@@ -482,8 +487,13 @@ impl Engine {
                 args.push("bestaudio/best".into());
                 args.push("-x".into());
                 let fmt = quality.unwrap_or("m4a");
-                args.push("--audio-format".into());
-                args.push(if fmt == "best" { "best".into() } else { fmt.to_string() });
+                // "best" / "original" = keep the original stream (no re-encode);
+                // yt-dlp rejects --audio-format best, so only pass the flag
+                // when the user picked an actual format.
+                if fmt != "best" && fmt != "original" {
+                    args.push("--audio-format".into());
+                    args.push(fmt.to_string());
+                }
                 if fmt == "mp3" {
                     args.push("--audio-quality".into());
                     args.push("0".into());
@@ -687,6 +697,30 @@ fn sanitize_filename(name: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// True when the sanitized name already ends in a plausible extension for the
+/// chosen kind so we don't append another one ("song.mp3.mp3").
+fn looks_like_final_name(name: &str, kind: &str) -> bool {
+    let ext = match name.rfind('.') {
+        Some(i) if i > 0 && i + 1 < name.len() => name[i + 1..].to_ascii_lowercase(),
+        _ => return false,
+    };
+    let audio = ["mp3", "m4a", "aac", "opus", "ogg", "oga", "flac", "wav", "wma", "aiff"];
+    let video = ["mp4", "mkv", "webm", "mov", "avi", "m4v", "flv", "ts", "mpg", "mpeg",
+                 "3gp", "wmv"];
+    let file = ["mp4","mkv","webm","mov","avi","m4v","flv","ts","mpg","mpeg","3gp","wmv",
+                "mp3","m4a","aac","opus","ogg","oga","flac","wav","wma","aiff",
+                "jpg","jpeg","png","gif","webp","bmp","svg","avif","tif","tiff","ico","heic",
+                "exe","msi","apk","dmg","pkg","deb","rpm","appimage","jar","ipa","snap",
+                "zip","rar","7z","tar","gz","tgz","bz2","xz","zst","iso","img",
+                "pdf","epub","mobi","txt","md","csv","json","xml","srt","vtt"];
+    match kind {
+        "audio" => audio.contains(&ext.as_str()),
+        "video" => video.contains(&ext.as_str()),
+        "file" => file.contains(&ext.as_str()),
+        _ => file.contains(&ext.as_str()),
+    }
 }
 
 // ----------------------------------------------------------- HEAD sniff --

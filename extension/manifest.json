@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GrabBox",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Grab any video, audio, image or file into your GrabBox app. The icon lights up when a page has something worth keeping.",
   "icons": {
     "16": "icons/icon-16.png",
@@ -27,12 +27,23 @@
       "matches": ["<all_urls>"],
       "js": ["content.js"],
       "css": ["inject.css"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": false
     }
   ],
-  "permissions": ["contextMenus", "tabs", "storage", "activeTab"],
+  "permissions": ["contextMenus", "tabs", "storage", "activeTab", "scripting"],
   "host_permissions": [
     "http://127.0.0.1/*",
     "http://localhost/*"
-  ]
+  ],
+  "commands": {
+    "grab-current": {
+      "suggested_key": {
+        "default": "Alt+G",
+        "mac": "Alt+G"
+      },
+      "description": "Grab the video/audio on this page"
+    }
+  }
 }

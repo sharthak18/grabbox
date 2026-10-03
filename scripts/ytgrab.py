@@ -374,8 +374,10 @@ def build_ladder(url):
         ("tv client (no PO token needed)",
          ["--extractor-args", "youtube:player_client=tv"]),
         # Skipping the dead android clients and adding web_safari is the older fix.
+        # ("default" is not a literal client name — "-android_vr" already means
+        # "the default set, minus android_vr".)
         ("skip android clients, add web_safari",
-         ["--extractor-args", "youtube:player_client=default,-android_vr,web_safari"]),
+         ["--extractor-args", "youtube:player_client=-android_vr,web_safari"]),
         ("web_embedded + web + tv",
          ["--extractor-args", "youtube:player_client=web_embedded,web,tv"]),
         # Sometimes the CDN route is the problem, not the client.
