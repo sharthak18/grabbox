@@ -1,5 +1,8 @@
 package app.grabbox.ui
 
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -168,16 +171,23 @@ fun HomeScreen(
                 }
             }
             if (jobs.isEmpty()) {
-                item {
-                    Text(
-                        "Nothing yet — paste a link or share one into the app.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(vertical = 8.dp),
-                    )
+                item(contentType = "empty") {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            "Nothing yet — paste a link, or use Share → GrabBox from any app.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(vertical = 8.dp),
+                        )
+                        Text(
+                            "Tip: in YouTube, Instagram, TikTok, etc. tap Share then Copy link and paste above.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             } else {
-                items(jobs, key = { it.id }) { job ->
+                items(jobs, key = { it.id }, contentType = { "job" }) { job ->
                     JobCard(
                         job = job,
                         onCancel = { viewModel.cancelJob(context, job.id) },
@@ -339,7 +349,25 @@ private fun ProbeCard(vm: GrabViewModel, p: Engine.ProbeInfo) {
 
 @Composable
 private fun JobCard(job: JobStore.Job, onCancel: () -> Unit, onOpen: () -> Unit) {
-    Card(shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
+    // Animate progress + status color so updating doesn't stutter.
+    val animatedProgress by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = (job.percent / 100f).coerceIn(0f, 1f),
+        animationSpec = tween(durationMillis = 400),
+        label = "jobProgress",
+    )
+    val statusColor by animateColorAsState(
+        targetValue = when (job.status) {
+            "done" -> DoneGreen
+            "error", "canceled" -> MaterialTheme.colorScheme.error
+            else -> MaterialTheme.colorScheme.primary
+        },
+        animationSpec = tween(200),
+        label = "statusColor",
+    )
+    Card(
+        shape = RoundedCornerShape(18.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
@@ -353,18 +381,10 @@ private fun JobCard(job: JobStore.Job, onCancel: () -> Unit, onOpen: () -> Unit)
                     val sub = buildString {
                         append(job.status)
                         if (job.percent >= 0) append(" · ${job.percent.toInt()}%")
-                        if (job.etaSec > 0 && job.status == "running") append(" · ${job.etaSec}s left")
+                        if (job.etaSec > 0 && job.status == "running") append(" · ${job.etaSec.toLong()}s left")
                         if (job.attempts > 1 && job.status == "running") append(" · attempt ${job.attempt}/${job.attempts}")
                     }
-                    Text(
-                        sub,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = when (job.status) {
-                            "done" -> DoneGreen
-                            "error", "canceled" -> MaterialTheme.colorScheme.error
-                            else -> MaterialTheme.colorScheme.primary
-                        },
-                    )
+                    Text(sub, style = MaterialTheme.typography.bodySmall, color = statusColor)
                 }
                 if (job.active) {
                     IconButton(onClick = onCancel) {
@@ -378,7 +398,7 @@ private fun JobCard(job: JobStore.Job, onCancel: () -> Unit, onOpen: () -> Unit)
             }
             if (job.status == "running" || job.status == "done") {
                 LinearProgressIndicator(
-                    progress = { (job.percent / 100f).coerceIn(0f, 1f) },
+                    progress = { animatedProgress },
                     modifier = Modifier.fillMaxWidth(),
                 )
             }

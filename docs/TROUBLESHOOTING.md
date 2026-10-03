@@ -94,14 +94,17 @@ The community-verified order that works now:
 ```bash
 # 1. the tv client needs NO PO token and no account - fixes most cases
 yt-dlp --extractor-args "youtube:player_client=tv" -f "bv*+ba/b" "URL"
-# 2. skip the dead android clients, add web_safari
-yt-dlp --extractor-args "youtube:player_client=default,-android_vr,web_safari" "URL"
+# 2. skip the dead android clients, add web_safari (no "default," prefix —
+#    a leading "-name" already means "remove from the default set")
+yt-dlp --extractor-args "youtube:player_client=-android_vr,web_safari" "URL"
 # 3. the embedded/tv mix some builds need
 yt-dlp --extractor-args "youtube:player_client=web_embedded,web,tv" "URL"
 ```
 
-`-name` means "remove this client from the list", so
-`default,-android_vr` is "the normal defaults, minus android_vr".
+`-name` means "remove this client from the default set", so
+`-android_vr,web_safari` is "the normal defaults, minus android_vr, plus
+web_safari". (Writing `default,-android_vr` is invalid — "default" is not
+itself a client name.)
 
 To get the *web* clients at full quality you need a PO-token provider. GrabBox
 vendors the `bgutil-ytdlp-pot-provider` plugin (it registers with yt-dlp

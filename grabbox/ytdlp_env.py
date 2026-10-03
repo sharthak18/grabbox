@@ -67,29 +67,69 @@ def find_ffmpeg():
         return None
 
 
+def _ffmpeg_binary_name():
+    return "ffmpeg.exe" if IS_WINDOWS else "ffmpeg"
+
+
+def _ffprobe_binary_name():
+    return "ffprobe.exe" if IS_WINDOWS else "ffprobe"
+
+
 def ffmpeg_location():
     """
-    A directory yt-dlp can use as ``ffmpeg_location``: it insists on files
-    literally named ``ffmpeg`` / ``ffprobe``, while the bundled static binary
-    has a long name. We expose it through same-name symlinks (the static build
-    is multi-call: invoked as ``ffprobe`` it behaves as ffprobe).
-    Returns None when there is no ffmpeg at all.
+    A directory yt-dlp can use as ``ffmpeg_location``: it expects a directory
+    containing binaries literally named ``ffmpeg`` and ``ffprobe``. When the
+    binary we found has some other name (e.g. the static builds shipped by
+    ``imageio-ffmpeg`` are named ``ffmpeg-linux-x86_64-v7.0.2``), we create
+    same-name symlinks (the static build is multi-call: invoked as ``ffprobe``
+    it behaves as ffprobe). If symlinking fails (Windows without Developer
+    Mode, or a read-only filesystem), we copy the binary instead. Returns
+    None when there is no ffmpeg at all.
     """
     real = find_ffmpeg()
     if not real:
         return None
-    if os.path.basename(real) in ("ffmpeg", "ffmpeg.exe"):
-        return os.path.dirname(real) or None
-    shim = os.path.join(os.path.dirname(os.path.dirname(real)), ".ffbin")
+    real_dir = os.path.dirname(os.path.abspath(real)) or None
+    want = _ffmpeg_binary_name()
+    if os.path.basename(real) == want:
+        # Already a well-named binary; its directory is the right answer as
+        # long as ffprobe is next to it. On many distros (and in the imageio
+        # vendor dir) it is. If not, we still want the shim.
+        ffprobe = os.path.join(real_dir, _ffprobe_binary_name())
+        if os.path.exists(ffprobe) or _is_multicall_ffmpeg(real):
+            return real_dir
+    shim = os.path.join(os.path.expanduser("~"), ".grabbox", "bin")
     try:
         os.makedirs(shim, exist_ok=True)
-        for name in ("ffmpeg", "ffprobe"):
+        for name in (want, _ffprobe_binary_name()):
             link = os.path.join(shim, name)
-            if not os.path.exists(link):
+            if os.path.exists(link):
+                continue
+            try:
                 os.symlink(real, link)
+            except (OSError, NotImplementedError):
+                # Symlinks aren't always available (Windows). Copy instead.
+                import shutil as _shutil
+                try:
+                    _shutil.copy2(real, link)
+                    try:
+                        os.chmod(link, 0o755)
+                    except OSError:
+                        pass
+                except OSError:
+                    return real_dir
         return shim
     except OSError:
-        return os.path.dirname(real) or None
+        return real_dir
+
+
+def _is_multicall_ffmpeg(path):
+    """Best-effort: imageio-ffmpeg builds are multi-call (ffmpeg/ffprobe)."""
+    try:
+        bn = os.path.basename(path).lower()
+        return bn.startswith("ffmpeg-") or "imageio_ffmpeg" in path.replace("\\", "/").lower()
+    except Exception:
+        return False
 
 
 def find_js_runtime():
@@ -153,9 +193,14 @@ def pot_provider():
         return None
 
 
-#: player clients that exist in yt-dlp 2026.08.19 (verified against
-#: INNERTUBE_CLIENTS). android_sdkless was removed, so old blog advice to use
-#: "player_client=default,-android_sdkless" now only prints a warning.
+#: Player clients that exist in yt-dlp 2026.08.19 (verified against
+#: INNERTUBE_CLIENTS). ``android_sdkless`` was removed long ago; old blog
+#: advice to use ``player_client=default,-android_sdkless`` now only prints a
+#: warning. Note that ``default`` is NOT itself a client — leading entries
+#: that start with ``-`` are applied on top of the default client set, so
+#: ``-android_vr,web_safari`` means "defaults, minus android_vr, plus
+#: web_safari" and ``default,-android_vr`` is invalid (it tries to select a
+#: client literally named "default" which does not exist).
 KNOWN_CLIENTS = (
     "tv", "tv_downgraded", "tv_simply", "web", "web_safari", "web_embedded",
     "web_music", "web_creator", "mweb", "android", "android_vr", "ios",
@@ -172,8 +217,9 @@ def is_youtube(url):
 def client_ladder(url):
     """
     Ordered list of ``(label, extractor_args, extra_opts)`` rungs to try when a
-    site blocks the request. ``-name`` means "drop this client from the list",
-    so ``default,-android_vr`` is "the normal defaults, minus android_vr".
+    site blocks the request. A leading ``-name`` means "drop this client from
+    the default set" (no ``default`` literal is needed), so ``-android_vr``
+    means "the normal defaults, minus android_vr".
     """
     if not is_youtube(url):
         return [("default", {}, {})]
@@ -186,7 +232,7 @@ def client_ladder(url):
         ("tv client - needs no PO token",
          {"youtube": {"player_client": ["tv"]}}, {}),
         ("skip android clients, add web_safari",
-         {"youtube": {"player_client": ["default", "-android_vr", "web_safari"]}}, {}),
+         {"youtube": {"player_client": ["-android_vr", "web_safari"]}}, {}),
         ("web_embedded + web + tv",
          {"youtube": {"player_client": ["web_embedded", "web", "tv"]}}, {}),
         ("IPv4 only, tv client",

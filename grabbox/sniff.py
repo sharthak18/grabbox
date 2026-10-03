@@ -106,9 +106,35 @@ def filename_from(url, content_disposition=None, content_type=None):
     return "download"
 
 
+def _open(url, method, timeout, headers=None):
+    """Open a request, returning (status, headers, final_url) or raising.
+
+    Uses a ranged GET for the fallback so we only pull the first byte or so —
+    enough to read headers without downloading a whole file.
+    """
+    hdrs = {"User-Agent": USER_AGENT}
+    if headers:
+        hdrs.update(headers)
+    if method == "RANGE":
+        req = urllib.request.Request(url, headers=dict(hdrs, Range="bytes=0-0"))
+    else:
+        req = urllib.request.Request(url, method=method, headers=hdrs)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # Consume any tiny body so the connection closes cleanly.
+        try:
+            resp.read(1024)
+        except Exception:
+            pass
+        return resp.status, resp.headers, resp.geturl()
+
+
 def probe(url, timeout=15):
     """
     Ask the server about a direct link. Returns a dict; never raises.
+
+    Tries HEAD first; if the server refuses HEAD (403/405/501) or drops the
+    connection, falls back to a ranged GET (bytes=0-0) so we can read the
+    response headers without pulling a whole file.
 
     ``{'ok', 'url', 'final_url', 'status', 'kind', 'filename', 'size',
        'content_type'}``
@@ -116,33 +142,56 @@ def probe(url, timeout=15):
     out = {"ok": False, "url": url, "final_url": url, "status": None,
            "kind": "other", "filename": None, "size": None, "content_type": None,
            "error": None}
-    req = urllib.request.Request(url, method="HEAD",
-                                 headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            headers = resp.headers
-            out.update(status=resp.status, final_url=resp.geturl())
-    except urllib.error.HTTPError as exc:
-        # Some servers refuse HEAD (405/403) but happily serve GET.
-        headers = exc.headers
-        out.update(status=exc.code, final_url=url)
-        if exc.code not in (403, 405, 501):
+    headers = None
+    last_err = None
+    for method in ("HEAD", "RANGE"):
+        try:
+            status, headers, final_url = _open(url, method, timeout)
+            out.update(status=status, final_url=final_url)
+            break
+        except urllib.error.HTTPError as exc:
+            # Read headers from the error response too — e.g. S3 returns 403
+            # but still sets Content-Type/Length.
+            headers = exc.headers
+            out.update(status=exc.code, final_url=exc.url or url)
+            if exc.code in (403, 405, 501) and method == "HEAD":
+                # HEAD refused — try the ranged GET fallback, but keep the
+                # headers we did get if the fallback also fails.
+                last_err = "HTTP %s" % exc.code
+                continue
             out["error"] = "HTTP %s" % exc.code
+            break
+        except Exception as exc:
+            last_err = str(exc)
+            if method == "HEAD":
+                continue
+            out["error"] = last_err
             return out
-    except Exception as exc:
-        out["error"] = str(exc)
+    if headers is None:
+        out["error"] = out["error"] or last_err or "no response"
         return out
 
     ctype = headers.get("Content-Type")
     cdisp = headers.get("Content-Disposition")
     length = headers.get("Content-Length")
+    # For ranged GET, Content-Range "bytes 0-0/12345" tells us the real size.
+    crange = headers.get("Content-Range")
     out["content_type"] = ctype
     out["filename"] = filename_from(out["final_url"], cdisp, ctype)
     out["kind"] = kind_of(out["filename"], ctype)
+    size = None
     try:
-        out["size"] = int(length) if length else None
+        size = int(length) if length else None
     except ValueError:
-        out["size"] = None
+        size = None
+    if size is None and crange:
+        m = re.search(r"/(\d+)", crange)
+        if m:
+            try:
+                size = int(m.group(1))
+            except ValueError:
+                size = None
+    out["size"] = size
     out["ok"] = out["status"] is not None and out["status"] < 400
     return out
 

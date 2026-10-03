@@ -76,8 +76,13 @@ def _format_selector(kind, quality):
     """Turn the UI's choice into a yt-dlp format selector + post-processing."""
     if kind == "audio":
         fmt = "bestaudio/best"
-        opts = {"format": fmt, "extract_audio": True,
-                "audioformat": quality or "m4a"}
+        opts = {"format": fmt, "extract_audio": True}
+        # "best" = keep the original audio stream; do not re-encode, so
+        # don't pass audioformat (yt-dlp rejects audioformat="best").
+        if quality and quality != "best":
+            opts["audioformat"] = quality
+        else:
+            opts["audioformat"] = "m4a"
         if quality == "mp3":
             opts["audioquality"] = "0"
         return opts
@@ -90,6 +95,37 @@ def _format_selector(kind, quality):
         return {"format": selector, "merge_output_format": "mp4"}
     # "file": let yt-dlp pick, which is right for direct links and archives
     return {"format": "b"}
+
+
+def _looks_like_final_name(name, kind):
+    """True when ``name`` already ends in a plausible extension for ``kind``."""
+    if not name:
+        return False
+    ext = os.path.splitext(name)[1].lstrip(".").lower()
+    if not ext:
+        return False
+    # Direct-file kind: if the user picked any real-looking extension, keep it.
+    if kind == "file":
+        return ext in _ALL_KNOWN_EXTS
+    # For audio/video, only treat known matching extensions as final.
+    if kind == "audio":
+        return ext in ("mp3", "m4a", "aac", "opus", "ogg", "oga", "flac",
+                       "wav", "wma", "aiff")
+    if kind == "video":
+        return ext in ("mp4", "mkv", "webm", "mov", "avi", "m4v", "flv",
+                       "ts", "mpg", "mpeg", "3gp", "wmv")
+    return False
+
+
+_ALL_KNOWN_EXTS = {
+    "mp4", "mkv", "webm", "mov", "avi", "m4v", "flv", "ts", "mpg", "mpeg",
+    "3gp", "wmv", "mp3", "m4a", "aac", "opus", "ogg", "oga", "flac", "wav",
+    "wma", "aiff", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif",
+    "tif", "tiff", "ico", "heic", "exe", "msi", "apk", "dmg", "pkg", "deb",
+    "rpm", "appimage", "flatpakref", "jar", "ipa", "snap", "zip", "rar",
+    "7z", "tar", "gz", "tgz", "bz2", "xz", "zst", "iso", "img", "pdf",
+    "epub", "mobi", "txt", "md", "csv", "json", "xml", "srt", "vtt",
+}
 
 
 def direct_filename(url, kind, cached=None):
@@ -117,7 +153,20 @@ class Manager(object):
         self.config = config
         self.jobs = {}
         self._lock = threading.Lock()
-        self._sem = threading.Semaphore(int(config.get("concurrency", 2)))
+        self._concurrency = int(config.get("concurrency", 2))
+        self._sem = threading.Semaphore(self._concurrency)
+
+    def set_concurrency(self, n):
+        """Adjust the semaphore so at most ``n`` jobs run in parallel.
+
+        Threading.Semaphore doesn't expose a setter, so we swap it. Already
+        running jobs keep their slot (they hold a permit on the old semaphore,
+        which they release when they finish — harmless).
+        """
+        n = max(1, int(n or 1))
+        with self._lock:
+            self._concurrency = n
+            self._sem = threading.Semaphore(n)
 
     # ------------------------------------------------------------------ api
 
@@ -202,7 +251,14 @@ class Manager(object):
         outtmpl = ("%(playlist_index)02d - %(title)s.%(ext)s" if playlist
                    else "%(title)s.%(ext)s")
         if filename:
-            outtmpl = sanitize_filename(filename) + ".%(ext)s"
+            safe = sanitize_filename(filename)
+            # If the user already gave a name that ends in a known extension
+            # for this kind, trust it and leave %(ext)s off so we don't end up
+            # with "song.mp3.mp3". Otherwise let yt-dlp append the real ext.
+            if _looks_like_final_name(safe, job.kind):
+                outtmpl = safe
+            else:
+                outtmpl = safe + ".%(ext)s"
         elif job.kind == "file":
             if job.direct is None:
                 job.direct = sniff.probe(job.url)   # one probe, then cached

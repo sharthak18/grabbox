@@ -107,7 +107,12 @@ class DownloadService : Service() {
             try {
                 YoutubeDL.getInstance().execute(request, jobId) { progress, eta, line ->
                     val now = System.currentTimeMillis()
-                    val pct = if (progress.isNaN() || progress < 0) -1f else progress
+                    // youtubedl-android reports progress in 0..1; convert to percent.
+                    val pct = when {
+                        progress.isNaN() || progress < 0f -> -1f
+                        progress <= 1f -> progress * 100f
+                        else -> progress
+                    }
                     JobStore.update(jobId) { it.copy(percent = pct, etaSec = eta) }
                     // final filename often arrives on output lines
                     if (line != null) {
