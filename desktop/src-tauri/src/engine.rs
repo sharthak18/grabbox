@@ -419,6 +419,7 @@ impl Engine {
     }
 
     /// The subprocess invocation for one rung of the ladder.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_download(
         &self,
         url: &str,
@@ -430,6 +431,9 @@ impl Engine {
         filename: Option<&str>,
         rung_args: &[String],
         archive: bool,
+        connections: i64,
+        speed_limit_kbps: i64,
+        turbo: bool,
     ) -> std::io::Result<std::process::Child> {
         let bin = self
             .ytdlp()
@@ -443,10 +447,28 @@ impl Engine {
             "10".into(),
             "--progress-template".into(),
             "GBX|%(progress.percent|0)s|%(progress.speed|0)s|%(progress.eta|0)s|%(progress.filename)s".into(),
+            "--socket-timeout".into(),
+            "30".into(),
             "-P".into(),
             outdir.to_string_lossy().into_owned(),
             "--embed-metadata".into(),
         ];
+        // The horse, yt-dlp edition: fragments in parallel, fat HTTP chunks.
+        if turbo {
+            if connections > 1 {
+                args.push("--concurrent-fragments".into());
+                args.push(connections.to_string());
+                args.push("--http-chunk-size".into());
+                args.push("10485760".into());
+            }
+            args.push("--buffer-size".into());
+            args.push("1048576".into());
+        }
+        if speed_limit_kbps > 0 {
+            args.push("--limit-rate".into());
+            args.push((speed_limit_kbps * 1024).to_string());
+        }
+
         // Only on Windows. Everywhere else the flag costs us the real filename:
         // yt-dlp then replaces every non-ASCII character and every space with
         // "_", so "My Song" becomes "My_Song" and a non-Latin title becomes a

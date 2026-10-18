@@ -116,6 +116,10 @@ fn default_map() -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("download_dir".into(), json!(default_dir));
     m.insert("concurrency".into(), json!(2));
+    // The horse (shared with the Python core, same config file).
+    m.insert("connections".into(), json!(8));
+    m.insert("speed_limit_kbps".into(), json!(0));
+    m.insert("turbo".into(), json!(true));
     m.insert("cookies_browser".into(), json!(""));
     m.insert("watch_clipboard".into(), json!(false));
     m.insert("port".into(), json!(8765));

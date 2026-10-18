@@ -25,8 +25,12 @@ function httpDriver() {
     health: () => get("/api/health"),
     probe: (url, cookies) => post("/api/probe", { url, cookies }),
     download: (b) => post("/api/download", b),
+    downloadBatch: (urls) => post("/api/download", { urls }),
     jobs: () => get("/api/jobs"),
     cancel: (id) => post(`/api/jobs/${id}/cancel`),
+    pause: (id) => post(`/api/jobs/${id}/pause`),
+    resume: (id) => post(`/api/jobs/${id}/resume`),
+    retry: (id) => post(`/api/jobs/${id}/retry`),
     clearJobs: () => post("/api/jobs/clear"),
     files: () => get("/api/files"),
     fileAction: (path, action) => post("/api/files/open", { path, action }),
@@ -46,8 +50,12 @@ function tauriDriver() {
     health: () => invoke("grabbox_health"),
     probe: (url, cookies) => invoke("grabbox_probe", { url, cookies: cookies || null }),
     download: (b) => invoke("grabbox_download", b),
+    downloadBatch: (urls) => invoke("grabbox_download_batch", { urls }),
     jobs: () => invoke("grabbox_jobs").then((jobs) => ({ jobs })),
     cancel: (id) => invoke("grabbox_cancel", { id }),
+    pause: (id) => invoke("grabbox_pause", { id }),
+    resume: (id) => invoke("grabbox_resume", { id }),
+    retry: (id) => invoke("grabbox_resume", { id }),
     clearJobs: () => invoke("grabbox_clear_jobs"),
     files: () => invoke("grabbox_files"),
     fileAction: (path, action) => invoke("grabbox_file_action", { path, action }),
@@ -396,6 +404,28 @@ function updateSizeHint() {
   $("#rSize").textContent = est ? `~${fmtBytes(est)}${dir ? " → " + dir : ""}` : (dir ? `saving to ${dir}` : "");
 }
 
+/* -------------------------------------------------------------- batch --- */
+
+/** Every http(s) URL in a blob of text (paste, drop, share sheet). */
+function extractUrls(text) {
+  const found = String(text || "").match(/https?:\/\/[^\s<>"']+/g) || [];
+  return [...new Set(found.map((u) => u.replace(/[)\].,;]+$/, "")))];
+}
+
+/** Queue many links at once with the defaults — no probing sheet per link. */
+async function quickQueue(urls) {
+  maybeAskNotify();
+  try {
+    const res = await driver.downloadBatch(urls);
+    const n = (res.jobs || []).length || urls.length;
+    toast(`Queued ${n} download${n === 1 ? "" : "s"} 🐎`);
+  } catch (e) {
+    toast(String(e));
+  }
+  $("#url").value = "";
+  refreshJobs(true);
+}
+
 /* ----------------------------------------------------------- download --- */
 
 async function startDownload() {
@@ -454,6 +484,12 @@ async function refreshJobs(force) {
     box.innerHTML = jobs.map(jobCard).join("");
     box.querySelectorAll("[data-cancel]").forEach((b) =>
       on(b, "click", async () => { await driver.cancel(b.dataset.cancel); refreshJobs(true); }));
+    box.querySelectorAll("[data-pause]").forEach((b) =>
+      on(b, "click", async () => { await driver.pause(b.dataset.pause); refreshJobs(true); }));
+    box.querySelectorAll("[data-resume]").forEach((b) =>
+      on(b, "click", async () => { await driver.resume(b.dataset.resume); refreshJobs(true); }));
+    box.querySelectorAll("[data-retry]").forEach((b) =>
+      on(b, "click", async () => { await driver.retry(b.dataset.retry); refreshJobs(true); }));
     box.querySelectorAll("[data-show]").forEach((b) =>
       on(b, "click", () => driver.fileAction(b.dataset.show, "reveal")));
     box.querySelectorAll("[data-play]").forEach((b) =>
@@ -478,15 +514,21 @@ function jobCard(j) {
   const parts = [];
   if (j.speed) parts.push(`${fmtBytes(j.speed)}/s`);
   if (j.eta) parts.push(`${Math.round(j.eta)}s left`);
+  if (j.segments > 1 && (j.status === "running" || j.status === "paused")) parts.push(`⚡×${j.segments}`);
+  if (j.size && j.downloaded) parts.push(`${fmtBytes(j.downloaded)} / ${fmtBytes(j.size)}`);
   if (j.items_total) parts.push(`item ${j.items_done || 1}/${j.items_total}`);
-  if (j.attempts_total > 1) parts.push(`attempt ${j.attempt}/${j.attempts_total}`);
+  if (j.attempts_total > 1 && j.status !== "paused") parts.push(`attempt ${j.attempt}/${j.attempts_total}`);
   const w = Math.max(0, Math.min(100, j.percent || 0));
   return `
   <div class="job ${cls}">
     <div class="job-top">
       <div class="job-title" title="${escapeAttr(j.filename || j.title || j.url)}">${escapeHtml(j.filename || j.title || j.url)}</div>
       <div class="job-actions">
-        ${j.status === "running" || j.status === "queued" ? `<button class="icon-btn" data-cancel="${j.id}" title="Stop" aria-label="Stop"><svg><use href="#i-close"/></svg></button>` : ""}
+        ${j.status === "running" ? `<button class="icon-btn" data-pause="${j.id}" title="Pause (keeps every byte)" aria-label="Pause"><svg><use href="#i-pause"/></svg></button>` : ""}
+        ${j.status === "queued" ? `<button class="icon-btn" data-pause="${j.id}" title="Hold" aria-label="Pause"><svg><use href="#i-pause"/></svg></button>` : ""}
+        ${j.status === "paused" ? `<button class="icon-btn" data-resume="${j.id}" title="Resume" aria-label="Resume"><svg><use href="#i-play"/></svg></button>` : ""}
+        ${j.status === "error" || j.status === "canceled" ? `<button class="icon-btn" data-retry="${j.id}" title="Retry (resumes partial file)" aria-label="Retry"><svg><use href="#i-retry"/></svg></button>` : ""}
+        ${j.status === "running" || j.status === "queued" || j.status === "paused" ? `<button class="icon-btn" data-cancel="${j.id}" title="Stop" aria-label="Stop"><svg><use href="#i-close"/></svg></button>` : ""}
         ${j.status === "done" && j.path ? `<button class="icon-btn" data-play="${escapeAttr(j.path)}" title="Play / open" aria-label="Open"><svg><use href="#i-play"/></svg></button>
           <button class="icon-btn" data-show="${escapeAttr(j.path)}" title="Show in folder" aria-label="Show in folder"><svg><use href="#i-folder"/></svg></button>` : ""}
       </div>
@@ -553,6 +595,9 @@ async function openSettings() {
   $("#sConc").value = String(config.concurrency || 2);
   $("#sCookies").value = config.cookies_browser || "";
   $("#sClip").checked = !!config.watch_clipboard;
+  if ($("#sConn")) $("#sConn").value = String(config.connections || 8);
+  if ($("#sLimit")) $("#sLimit").value = String(config.speed_limit_kbps || 0);
+  if ($("#sTurbo")) $("#sTurbo").checked = config.turbo !== false;
   if (driver.pickFolder) $("#sBrowse").classList.remove("hidden");
   const h = await driver.health();
   $("#sHealth").textContent = [
@@ -573,6 +618,9 @@ async function saveSettings() {
     concurrency: Math.max(1, parseInt($("#sConc").value || "2", 10)),
     cookies_browser: $("#sCookies").value,
     watch_clipboard: $("#sClip").checked,
+    connections: Math.max(1, Math.min(16, parseInt(($("#sConn") || {}).value || "8", 10) || 8)),
+    speed_limit_kbps: Math.max(0, parseInt(($("#sLimit") || {}).value || "0", 10) || 0),
+    turbo: $("#sTurbo") ? $("#sTurbo").checked : true,
   });
   closeDlg("settings");
   toast("Settings saved");
@@ -725,10 +773,12 @@ function setupDragDrop() {
     depth = 0;
     overlay.classList.add("hidden");
     const text = e.dataTransfer.getData("text/uri-list") || e.dataTransfer.getData("text/plain") || "";
-    const url = text.split("\n").map((l) => l.trim()).find((l) => /^https?:\/\//.test(l));
-    if (url) {
-      $("#url").value = url;
-      analyze(url);
+    const urls = extractUrls(text);
+    if (urls.length > 1) {
+      quickQueue(urls);           // dropped a whole list: queue everything
+    } else if (urls.length === 1) {
+      $("#url").value = urls[0];
+      analyze(urls[0]);
     } else {
       toast("That did not look like a link");
     }
@@ -750,7 +800,16 @@ document.addEventListener("DOMContentLoaded", () => {
 
   on($("#go"), "click", () => analyze($("#url").value));
   on($("#url"), "keydown", (e) => { if (e.key === "Enter") analyze($("#url").value); });
-  on($("#url"), "paste", () => setTimeout(() => analyze($("#url").value), 60));
+  on($("#url"), "paste", (e) => {
+    const text = (e.clipboardData || window.clipboardData)?.getData("text") || "";
+    const urls = extractUrls(text);
+    if (urls.length > 1) {
+      e.preventDefault();
+      quickQueue(urls);           // pasted a list: queue everything
+    } else {
+      setTimeout(() => analyze($("#url").value), 60);  // one link: show it first
+    }
+  });
   on($("#rDownload"), "click", startDownload);
   on($("#rClose"), "click", () => $("#result").classList.add("hidden"));
   on($("#clearJobs"), "click", async () => { await driver.clearJobs(); lastJobState = ""; refreshJobs(true); });

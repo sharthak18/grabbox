@@ -96,6 +96,60 @@ fn grabbox_cancel(state: tauri::State<'_, AppState>, id: String) -> Result<Value
 }
 
 #[tauri::command]
+fn grabbox_pause(state: tauri::State<'_, AppState>, id: String) -> Result<Value, String> {
+    Ok(json!({ "ok": state.manager.pause(&id) }))
+}
+
+#[tauri::command]
+async fn grabbox_resume(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<Value, String> {
+    let engine = state.engine.clone();
+    let cfg = state.config.clone();
+    let manager = state.manager.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok::<Value, String>(json!({ "ok": manager.resume(engine, cfg, &id) }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn grabbox_download_batch(
+    state: tauri::State<'_, AppState>,
+    urls: Vec<String>,
+) -> Result<Value, String> {
+    let engine = state.engine.clone();
+    let cfg = state.config.clone();
+    let manager = state.manager.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut jobs = Vec::new();
+        for url in &urls {
+            let url = url.trim();
+            if url.is_empty() {
+                continue;
+            }
+            let job = manager.add(
+                engine.clone(),
+                cfg.clone(),
+                url,
+                "file",
+                None,
+                false,
+                None,
+                None,
+                None,
+            );
+            jobs.push(job.snapshot());
+        }
+        Ok::<Value, String>(json!({ "jobs": jobs }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 fn grabbox_clear_jobs(state: tauri::State<'_, AppState>) -> Result<Value, String> {
     state.manager.clear_finished();
     Ok(json!({ "ok": true }))
@@ -293,6 +347,9 @@ pub fn run() {
             grabbox_download,
             grabbox_jobs,
             grabbox_cancel,
+            grabbox_pause,
+            grabbox_resume,
+            grabbox_download_batch,
             grabbox_clear_jobs,
             grabbox_files,
             grabbox_file_action,

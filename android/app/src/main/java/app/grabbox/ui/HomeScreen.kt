@@ -43,6 +43,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -192,6 +193,9 @@ fun HomeScreen(
                         job = job,
                         onCancel = { viewModel.cancelJob(context, job.id) },
                         onOpen = { viewModel.openFile(context, job) },
+                        onPause = { viewModel.pauseJob(context, job.id) },
+                        onResume = { viewModel.resumeJob(context, job.id) },
+                        onRetry = { viewModel.retryJob(context, job.id) },
                     )
                 }
             }
@@ -348,7 +352,14 @@ private fun ProbeCard(vm: GrabViewModel, p: Engine.ProbeInfo) {
 }
 
 @Composable
-private fun JobCard(job: JobStore.Job, onCancel: () -> Unit, onOpen: () -> Unit) {
+private fun JobCard(
+    job: JobStore.Job,
+    onCancel: () -> Unit,
+    onOpen: () -> Unit,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
+    onRetry: () -> Unit,
+) {
     // Animate progress + status color so updating doesn't stutter.
     val animatedProgress by androidx.compose.animation.core.animateFloatAsState(
         targetValue = (job.percent / 100f).coerceIn(0f, 1f),
@@ -381,22 +392,49 @@ private fun JobCard(job: JobStore.Job, onCancel: () -> Unit, onOpen: () -> Unit)
                     val sub = buildString {
                         append(job.status)
                         if (job.percent >= 0) append(" · ${job.percent.toInt()}%")
+                        if ((job.status == "running" || job.status == "paused") &&
+                            Engine.turbo && Engine.connections > 1
+                        ) append(" · ⚡×${Engine.connections}")
                         if (job.etaSec > 0 && job.status == "running") append(" · ${job.etaSec.toLong()}s left")
                         if (job.attempts > 1 && job.status == "running") append(" · attempt ${job.attempt}/${job.attempts}")
                     }
                     Text(sub, style = MaterialTheme.typography.bodySmall, color = statusColor)
                 }
-                if (job.active) {
-                    IconButton(onClick = onCancel) {
-                        Icon(Icons.Default.Close, contentDescription = "Stop")
+                when {
+                    job.status == "running" -> {
+                        IconButton(onClick = onPause) {
+                            Text("⏸", contentDescription = "Pause (keeps every byte)")
+                        }
+                        IconButton(onClick = onCancel) {
+                            Icon(Icons.Default.Close, contentDescription = "Stop")
+                        }
                     }
-                } else if (job.status == "done" && job.filePath != null) {
-                    IconButton(onClick = onOpen) {
-                        Icon(Icons.Default.PlayArrow, contentDescription = "Open")
+                    job.status == "queued" -> {
+                        IconButton(onClick = onCancel) {
+                            Icon(Icons.Default.Close, contentDescription = "Stop")
+                        }
+                    }
+                    job.status == "paused" -> {
+                        IconButton(onClick = onResume) {
+                            Icon(Icons.Default.PlayArrow, contentDescription = "Resume")
+                        }
+                        IconButton(onClick = onCancel) {
+                            Icon(Icons.Default.Close, contentDescription = "Stop")
+                        }
+                    }
+                    job.status == "error" || job.status == "canceled" -> {
+                        IconButton(onClick = onRetry) {
+                            Icon(Icons.Default.Refresh, contentDescription = "Retry (resumes partial file)")
+                        }
+                    }
+                    job.status == "done" && job.filePath != null -> {
+                        IconButton(onClick = onOpen) {
+                            Icon(Icons.Default.PlayArrow, contentDescription = "Open")
+                        }
                     }
                 }
             }
-            if (job.status == "running" || job.status == "done") {
+            if (job.status == "running" || job.status == "paused" || job.status == "done") {
                 LinearProgressIndicator(
                     progress = { animatedProgress },
                     modifier = Modifier.fillMaxWidth(),
@@ -412,6 +450,7 @@ private fun JobCard(job: JobStore.Job, onCancel: () -> Unit, onOpen: () -> Unit)
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SettingsDialog(vm: GrabViewModel) {
     val context = LocalContext.current
@@ -431,6 +470,38 @@ private fun SettingsDialog(vm: GrabViewModel) {
                             onClick = { vm.setDir(path) },
                         )
                         Text(label, style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+                Text("🐎 Horse — download engine", style = MaterialTheme.typography.titleSmall)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Turbo (multi-connection)",
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Switch(checked = vm.turbo, onCheckedChange = { vm.setTurbo(it) })
+                }
+                Text("Connections per file", style = MaterialTheme.typography.bodySmall)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(1, 2, 4, 8, 16).forEach { n ->
+                        FilterChip(
+                            selected = vm.connections == n,
+                            onClick = { vm.setConnections(n) },
+                            label = { Text("$n") },
+                        )
+                    }
+                }
+                Text("Speed limit", style = MaterialTheme.typography.bodySmall)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(
+                        0 to "Unlimited", 512 to "512 KB/s", 1024 to "1 MB/s",
+                        5120 to "5 MB/s", 10240 to "10 MB/s",
+                    ).forEach { (kbps, label) ->
+                        FilterChip(
+                            selected = vm.speedLimitKbps == kbps,
+                            onClick = { vm.setSpeedLimitKbps(kbps) },
+                            label = { Text(label) },
+                        )
                     }
                 }
                 FilledTonalButton(

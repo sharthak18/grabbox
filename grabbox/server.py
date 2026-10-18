@@ -146,6 +146,23 @@ class Handler(BaseHTTPRequestHandler):
                 url, cookies=self.config.get("cookies_browser") or None))
 
         if path == "/api/download":
+            # Batch: many links at once, queued with the defaults — the
+            # VidMate move. Each still probes as it downloads.
+            urls = body.get("urls")
+            if isinstance(urls, list) and urls:
+                jobs = []
+                for u in urls:
+                    u = (u or "").strip()
+                    if not u:
+                        continue
+                    job = self.manager.add(
+                        u, kind="file",
+                        directory=body.get("dir") or None,
+                        cookies=body.get("cookies")
+                                or self.config.get("cookies_browser") or None,
+                    )
+                    jobs.append(job.to_dict())
+                return self._send(200, {"jobs": jobs})
             url = (body.get("url") or "").strip()
             if not url:
                 return self._send(400, {"error": "no url"})
@@ -168,6 +185,12 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/jobs/([^/]+)/cancel$", path)
         if m:
             return self._send(200, {"ok": self.manager.cancel(m.group(1))})
+
+        m = re.match(r"^/api/jobs/([^/]+)/(pause|resume|retry)$", path)
+        if m:
+            action = m.group(2)
+            fn = self.manager.pause if action == "pause" else self.manager.resume
+            return self._send(200, {"ok": fn(m.group(1))})
 
         if path == "/api/files/open":
             target = body.get("path") or self.config.download_dir()

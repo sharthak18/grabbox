@@ -9,6 +9,10 @@ DEFAULT_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "GrabBox")
 DEFAULTS = {
     "download_dir": DEFAULT_DIR,
     "concurrency": 2,
+    # --- the horse ---------------------------------------------------
+    "connections": 8,            # segments / concurrent fragments, 1..16
+    "speed_limit_kbps": 0,       # 0 = unlimited
+    "turbo": True,               # segmented direct downloads + fragments
     "cookies_browser": "",       # "" | chrome | firefox | edge | brave | safari
     "watch_clipboard": False,
     "port": 8765,
