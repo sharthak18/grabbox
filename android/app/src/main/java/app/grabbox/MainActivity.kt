@@ -12,10 +12,22 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.Icon
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.Text
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
+import app.grabbox.ui.BrowserScreen
 import app.grabbox.ui.GrabBoxTheme
 import app.grabbox.ui.HomeScreen
 import java.util.regex.Pattern
@@ -42,14 +54,10 @@ class MainActivity : ComponentActivity() {
         setContent {
             val engine by (application as GrabBoxApp).engineState.collectAsState()
             GrabBoxTheme {
-                androidx.compose.foundation.layout.Column(
-                    androidx.compose.ui.Modifier.fillMaxSize()
-                ) {
-                    androidx.compose.foundation.layout.Box(
-                        androidx.compose.ui.Modifier.weight(1f)
-                    ) {
+                Column(Modifier.fillMaxSize()) {
+                    Box(Modifier.weight(1f)) {
                         when (viewModel.tab) {
-                            "browse" -> app.grabbox.ui.BrowserScreen(
+                            "browse" -> BrowserScreen(
                                 onGrab = { viewModel.grabFromBrowser(it) }
                             )
                             else -> HomeScreen(
@@ -61,28 +69,22 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                     }
-                    androidx.compose.material3.NavigationBar {
-                        androidx.compose.material3.NavigationBarItem(
+                    NavigationBar {
+                        NavigationBarItem(
                             selected = viewModel.tab == "home",
                             onClick = { viewModel.tab = "home" },
                             icon = {
-                                androidx.compose.material3.Icon(
-                                    androidx.compose.material.icons.Icons.Default.Home,
-                                    contentDescription = null,
-                                )
+                                Icon(Icons.Default.Home, contentDescription = null)
                             },
-                            label = { androidx.compose.material3.Text("Grab") },
+                            label = { Text("Grab") },
                         )
-                        androidx.compose.material3.NavigationBarItem(
+                        NavigationBarItem(
                             selected = viewModel.tab == "browse",
                             onClick = { viewModel.tab = "browse" },
                             icon = {
-                                androidx.compose.material3.Icon(
-                                    androidx.compose.material.icons.Icons.Default.Search,
-                                    contentDescription = null,
-                                )
+                                Icon(Icons.Default.Search, contentDescription = null)
                             },
-                            label = { androidx.compose.material3.Text("Browse") },
+                            label = { Text("Browse") },
                         )
                     }
                 }

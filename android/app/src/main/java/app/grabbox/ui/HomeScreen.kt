@@ -403,7 +403,7 @@ private fun JobCard(
                 when {
                     job.status == "running" -> {
                         IconButton(onClick = onPause) {
-                            Text("⏸", contentDescription = "Pause (keeps every byte)")
+                            Text("⏸")   // pause (keeps every byte)
                         }
                         IconButton(onClick = onCancel) {
                             Icon(Icons.Default.Close, contentDescription = "Stop")
