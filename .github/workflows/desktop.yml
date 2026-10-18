@@ -82,6 +82,22 @@ jobs:
             | while IFS= read -r line; do
                 echo "::error title=cargo check::${line}"
               done
+          if [ "$status" -ne 0 ]; then
+            # Do not leave the real error buried in an expired log: surface
+            # the tail where a maintainer can read it (this step failing on
+            # Windows went undiagnosed for releases because it did not).
+            {
+              echo "### \`cargo check\` exited $status — log tail"
+              echo '```'
+              tail -c 20000 /tmp/cargo.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            tail -25 /tmp/cargo.log \
+              | sed -e 's/%/%25/g' -e 's/\r/%0D/g' \
+              | while IFS= read -r line; do
+                  echo "::error title=cargo check log::${line}"
+                done
+          fi
           exit $status
 
       - name: Build the app + installers
