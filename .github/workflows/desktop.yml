@@ -82,6 +82,12 @@ jobs:
       # reporting below ever executes — that bug hid the Windows failure.
       - name: cargo check
         working-directory: desktop/src-tauri
+        # Without this, Windows runs the step under PowerShell, which cannot
+        # parse the bash below at all — the step died in seconds with an
+        # empty log (long pre-existing on main, invisible until the logging
+        # fix above). macOS/Linux default to bash, which is why only the
+        # Windows job ever failed here.
+        shell: bash
         run: |
           cargo check --message-format short > /tmp/cargo.log 2>&1 || status=$?
           status=${status:-0}
