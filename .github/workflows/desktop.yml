@@ -67,21 +67,30 @@ jobs:
             desktop/src-tauri/target/
           key: tauri-${{ matrix.triple }}-${{ hashFiles('desktop/src-tauri/Cargo.toml') }}
 
+      # Windows runners do not put cargo on Git Bash's PATH, which made
+      # this step fail in seconds with "exit code 1" and no error text —
+      # already on main, long before anyone looked. Guarantee the toolchain.
+      - name: Set up Rust (Windows)
+        if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+
       # Fast compile gate. tauri-action runs cargo inside a composite action
       # and swallows its output, so a Rust error is unreadable from a PR. This
       # surfaces it as annotations, and fails in ~2 minutes instead of after
-      # the full bundle.
+      # the full bundle. Note the `|| true` guards: GitHub runs bash with
+      # -eo pipefail, so a no-match grep would kill the step before the
+      # reporting below ever executes — that bug hid the Windows failure.
       - name: cargo check
         working-directory: desktop/src-tauri
         run: |
           cargo check --message-format short > /tmp/cargo.log 2>&1 || status=$?
           status=${status:-0}
-          grep -E "error(\[E[0-9]+\])?\[|: error|cannot find|no method|unresolved|mismatched" \
-            /tmp/cargo.log | head -20 \
+          { grep -E "error(\[E[0-9]+\])?\[|: error|cannot find|no method|unresolved|mismatched" \
+            /tmp/cargo.log || true; } | head -20 \
             | sed -e 's/%/%25/g' -e 's/\r/%0D/g' \
             | while IFS= read -r line; do
                 echo "::error title=cargo check::${line}"
-              done
+              done || true
           if [ "$status" -ne 0 ]; then
             # Do not leave the real error buried in an expired log: surface
             # the tail where a maintainer can read it (this step failing on
@@ -89,14 +98,14 @@ jobs:
             {
               echo "### \`cargo check\` exited $status — log tail"
               echo '```'
-              tail -c 20000 /tmp/cargo.log
+              tail -c 20000 /tmp/cargo.log || true
               echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+            } >> "$GITHUB_STEP_SUMMARY" || true
             tail -25 /tmp/cargo.log \
               | sed -e 's/%/%25/g' -e 's/\r/%0D/g' \
               | while IFS= read -r line; do
                   echo "::error title=cargo check log::${line}"
-                done
+                done || true
           fi
           exit $status
 

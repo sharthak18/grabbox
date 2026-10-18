@@ -479,14 +479,14 @@ private fun SettingsDialog(vm: GrabViewModel) {
                         style = MaterialTheme.typography.bodyMedium,
                         modifier = Modifier.weight(1f),
                     )
-                    Switch(checked = vm.turbo, onCheckedChange = { vm.setTurbo(it) })
+                    Switch(checked = vm.turbo, onCheckedChange = { vm.updateTurbo(it) })
                 }
                 Text("Connections per file", style = MaterialTheme.typography.bodySmall)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf(1, 2, 4, 8, 16).forEach { n ->
                         FilterChip(
                             selected = vm.connections == n,
-                            onClick = { vm.setConnections(n) },
+                            onClick = { vm.updateConnections(n) },
                             label = { Text("$n") },
                         )
                     }
@@ -499,7 +499,7 @@ private fun SettingsDialog(vm: GrabViewModel) {
                     ).forEach { (kbps, label) ->
                         FilterChip(
                             selected = vm.speedLimitKbps == kbps,
-                            onClick = { vm.setSpeedLimitKbps(kbps) },
+                            onClick = { vm.updateSpeedLimitKbps(kbps) },
                             label = { Text(label) },
                         )
                     }

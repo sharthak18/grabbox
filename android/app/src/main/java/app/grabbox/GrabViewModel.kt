@@ -72,17 +72,17 @@ class GrabViewModel : ViewModel() {
             .apply()
     }
 
-    fun setConnections(value: Int) {
+    fun updateConnections(value: Int) {
         connections = value.coerceIn(1, 16)
         applyHorse()
     }
 
-    fun setSpeedLimitKbps(value: Int) {
+    fun updateSpeedLimitKbps(value: Int) {
         speedLimitKbps = value.coerceAtLeast(0)
         applyHorse()
     }
 
-    fun setTurbo(value: Boolean) {
+    fun updateTurbo(value: Boolean) {
         turbo = value
         applyHorse()
     }
