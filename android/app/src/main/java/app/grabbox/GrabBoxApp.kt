@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
 import android.util.Log
+import app.grabbox.work.JobStore
 import com.yausername.ffmpeg.FFmpeg
 import com.yausername.youtubedl_android.YoutubeDL
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -38,6 +39,7 @@ class GrabBoxApp : Application() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        JobStore.init(this)   // restore the persisted queue before the UI reads it
         startEngine()
         createNotificationChannel()
     }

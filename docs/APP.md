@@ -18,6 +18,9 @@ playlists). There are four ways to use it:
 
 Everything runs **on your device**. Nothing is uploaded anywhere.
 
+How the downloading itself got fast — and learned to never lose its place:
+**[HORSE.md](HORSE.md)**, the segmented-engine spec shared by every platform.
+
 ---
 
 ## 1a. Desktop app (recommended on computers)

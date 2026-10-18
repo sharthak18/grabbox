@@ -25,8 +25,13 @@ class DownloadService : Service() {
     companion object {
         const val ACTION_START = "app.grabbox.action.START_DOWNLOAD"
         const val ACTION_CANCEL = "app.grabbox.action.CANCEL_DOWNLOAD"
+        const val ACTION_PAUSE = "app.grabbox.action.PAUSE_DOWNLOAD"
+        const val ACTION_RESUME = "app.grabbox.action.RESUME_DOWNLOAD"
         const val EXTRA_JOB_ID = "jobId"
         private const val NOTIFY_ACTIVE = 1001
+
+        /** IDM manners: this many at once, the rest wait their turn. */
+        const val MAX_PARALLEL = 2
 
         fun start(context: Context, jobId: String) {
             val intent = Intent(context, DownloadService::class.java)
@@ -41,10 +46,27 @@ class DownloadService : Service() {
                 .putExtra(EXTRA_JOB_ID, jobId)
             context.startService(intent)
         }
+
+        fun pause(context: Context, jobId: String) {
+            val intent = Intent(context, DownloadService::class.java)
+                .setAction(ACTION_PAUSE)
+                .putExtra(EXTRA_JOB_ID, jobId)
+            context.startService(intent)
+        }
+
+        fun resume(context: Context, jobId: String) {
+            val intent = Intent(context, DownloadService::class.java)
+                .setAction(ACTION_RESUME)
+                .putExtra(EXTRA_JOB_ID, jobId)
+            context.startForegroundService(intent)
+        }
     }
 
     private val running = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val canceled = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val paused = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val slotHolders = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val slots = java.util.concurrent.Semaphore(MAX_PARALLEL)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -53,15 +75,44 @@ class DownloadService : Service() {
             ACTION_CANCEL -> {
                 val id = intent.getStringExtra(EXTRA_JOB_ID) ?: return START_NOT_STICKY
                 canceled.add(id)
+                paused.remove(id)
                 YoutubeDL.getInstance().destroyProcessById(id)
                 JobStore.update(id) {
-                    if (it.active) it.copy(status = "canceled") else it
+                    if (it.active || it.status == "paused") {
+                        it.copy(status = "canceled")
+                    } else {
+                        it
+                    }
                 }
                 if (!JobStore.hasActive()) stopIfIdle()
                 return START_NOT_STICKY
             }
+            ACTION_PAUSE -> {
+                val id = intent.getStringExtra(EXTRA_JOB_ID) ?: return START_NOT_STICKY
+                paused.add(id)
+                // Killing the process mid-stream is safe: the .part file
+                // stays, and Resume continues it instead of restarting.
+                YoutubeDL.getInstance().destroyProcessById(id)
+                JobStore.update(id) {
+                    if (it.active) it.copy(status = "paused") else it
+                }
+                return START_NOT_STICKY
+            }
+            ACTION_RESUME -> {
+                val id = intent.getStringExtra(EXTRA_JOB_ID) ?: return START_NOT_STICKY
+                paused.remove(id)
+                canceled.remove(id)
+                if (!running.contains(id)) {
+                    running.add(id)
+                    startInForeground(id)
+                    Thread { runJob(id) }.start()
+                }
+                return START_STICKY
+            }
             ACTION_START -> {
                 val id = intent.getStringExtra(EXTRA_JOB_ID) ?: return START_NOT_STICKY
+                paused.remove(id)
+                canceled.remove(id)
                 if (!running.contains(id)) {
                     running.add(id)
                     startInForeground(id)
@@ -91,12 +142,20 @@ class DownloadService : Service() {
         val job = JobStore.get(jobId) ?: return stopIfIdle()
         val outDir = File(job.outDir).apply { mkdirs() }
         val ladder = Engine.ladder(job.url)
+
+        // At most MAX_PARALLEL at once; the rest wait their turn. A pause
+        // or cancel that lands while waiting is honoured before we start.
+        while (!slots.tryAcquire(500, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+            if (jobId in canceled || jobId in paused) return finish(jobId)
+        }
+        slotHolders.add(jobId)
         JobStore.update(jobId) { it.copy(status = "running", attempts = ladder.size) }
 
         var lastError = ""
         var lastHint = ""
         ladder.forEachIndexed { index, (_, rungArgs) ->
             if (jobId in canceled) return finish(jobId)
+            if (jobId in paused) return finish(jobId)
             val attempt = index + 1
             JobStore.update(jobId) { it.copy(attempt = attempt, percent = -1f) }
             val request = Engine.buildRequest(
@@ -138,6 +197,11 @@ class DownloadService : Service() {
                 notifyDone(jobId)
                 return finish(jobId)
             } catch (e: Exception) {
+                if (jobId in paused) {
+                    // Paused on purpose: keep the .part, keep the place.
+                    JobStore.update(jobId) { it.copy(status = "paused", error = null, hint = null) }
+                    return finish(jobId)
+                }
                 if (jobId in canceled) {
                     JobStore.update(jobId) { it.copy(status = "canceled") }
                     return finish(jobId)
@@ -157,6 +221,8 @@ class DownloadService : Service() {
     private fun finish(jobId: String) {
         running.remove(jobId)
         canceled.remove(jobId)
+        paused.remove(jobId)
+        if (slotHolders.remove(jobId)) slots.release()
         stopIfIdle()
     }
 

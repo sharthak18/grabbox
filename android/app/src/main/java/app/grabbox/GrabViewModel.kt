@@ -39,7 +39,59 @@ class GrabViewModel : ViewModel() {
     var settingsOpen by mutableStateOf(false)
     var statusText by mutableStateOf<String?>(null)
 
+    /** Which face is showing: the grabber ("home") or the browser ("browse"). */
+    var tab by mutableStateOf("home")
+
+    // The horse, persisted — same spec as the desktop engines.
+    var connections by mutableStateOf(Engine.connections)
+    var speedLimitKbps by mutableStateOf(Engine.speedLimitKbps)
+    var turbo by mutableStateOf(Engine.turbo)
+
     val jobs = JobStore.jobs
+
+    /** Restore settings (folder + horse) once, at app start. */
+    fun loadSettings() {
+        val prefs = GrabBoxApp.instance.getSharedPreferences("grabbox", Context.MODE_PRIVATE)
+        downloadDir = prefs.getString("download_dir", downloadDir) ?: downloadDir
+        connections = prefs.getInt("connections", 8).coerceIn(1, 16)
+        speedLimitKbps = prefs.getInt("speed_limit_kbps", 0).coerceAtLeast(0)
+        turbo = prefs.getBoolean("turbo", true)
+        applyHorse()
+    }
+
+    private fun applyHorse() {
+        Engine.connections = connections
+        Engine.speedLimitKbps = speedLimitKbps
+        Engine.turbo = turbo
+        GrabBoxApp.instance.getSharedPreferences("grabbox", Context.MODE_PRIVATE)
+            .edit()
+            .putString("download_dir", downloadDir)
+            .putInt("connections", connections)
+            .putInt("speed_limit_kbps", speedLimitKbps)
+            .putBoolean("turbo", turbo)
+            .apply()
+    }
+
+    fun updateConnections(value: Int) {
+        connections = value.coerceIn(1, 16)
+        applyHorse()
+    }
+
+    fun updateSpeedLimitKbps(value: Int) {
+        speedLimitKbps = value.coerceAtLeast(0)
+        applyHorse()
+    }
+
+    fun updateTurbo(value: Boolean) {
+        turbo = value
+        applyHorse()
+    }
+
+    /** A link grabbed in the browser: hand it to the probe-and-pick flow. */
+    fun grabFromBrowser(url: String) {
+        tab = "home"
+        pasteAndAnalyze(url)
+    }
 
     private var probeJob: Job? = null
 
@@ -114,6 +166,13 @@ class GrabViewModel : ViewModel() {
     }
 
     fun cancelJob(context: Context, id: String) = DownloadService.cancel(context, id)
+
+    fun pauseJob(context: Context, id: String) = DownloadService.pause(context, id)
+
+    fun resumeJob(context: Context, id: String) = DownloadService.resume(context, id)
+
+    /** Retry is resume: both engines continue partial files. */
+    fun retryJob(context: Context, id: String) = DownloadService.resume(context, id)
 
     fun clearFinished() = JobStore.clearFinished()
 

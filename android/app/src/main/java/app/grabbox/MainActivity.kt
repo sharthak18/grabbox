@@ -12,10 +12,22 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.Icon
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.Text
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
+import app.grabbox.ui.BrowserScreen
 import app.grabbox.ui.GrabBoxTheme
 import app.grabbox.ui.HomeScreen
 import java.util.regex.Pattern
@@ -37,14 +49,45 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         viewModel = ViewModelProvider(this)[GrabViewModel::class.java]
 
+        viewModel.loadSettings()
+
         setContent {
             val engine by (application as GrabBoxApp).engineState.collectAsState()
             GrabBoxTheme {
-                HomeScreen(
-                    viewModel = viewModel,
-                    engineState = engine,
-                    onRetryEngine = { (application as GrabBoxApp).startEngine() },
-                )
+                Column(Modifier.fillMaxSize()) {
+                    Box(Modifier.weight(1f)) {
+                        when (viewModel.tab) {
+                            "browse" -> BrowserScreen(
+                                onGrab = { viewModel.grabFromBrowser(it) }
+                            )
+                            else -> HomeScreen(
+                                viewModel = viewModel,
+                                engineState = engine,
+                                onRetryEngine = {
+                                    (application as GrabBoxApp).startEngine()
+                                },
+                            )
+                        }
+                    }
+                    NavigationBar {
+                        NavigationBarItem(
+                            selected = viewModel.tab == "home",
+                            onClick = { viewModel.tab = "home" },
+                            icon = {
+                                Icon(Icons.Default.Home, contentDescription = null)
+                            },
+                            label = { Text("Grab") },
+                        )
+                        NavigationBarItem(
+                            selected = viewModel.tab == "browse",
+                            onClick = { viewModel.tab = "browse" },
+                            icon = {
+                                Icon(Icons.Default.Search, contentDescription = null)
+                            },
+                            label = { Text("Browse") },
+                        )
+                    }
+                }
             }
         }
 

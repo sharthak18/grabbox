@@ -36,6 +36,12 @@ object Engine {
         val hint: String? = null,
     )
 
+    // The horse, shared spec with the desktop engines. GrabViewModel keeps
+    // these in sync with the user's settings.
+    var connections: Int = 8
+    var speedLimitKbps: Int = 0
+    var turbo: Boolean = true
+
     // Friendly quality labels, keyed by what gets passed to buildRequest().
     val VIDEO_QUALITIES = listOf(
         "best" to "Best",
@@ -182,6 +188,17 @@ object Engine {
         request.addOption("--no-warnings")
         request.addOption("--retries", "10")
         request.addOption("--fragment-retries", "10")
+        // The horse, yt-dlp edition: fragments in parallel, fat HTTP chunks.
+        if (turbo) {
+            if (connections > 1) {
+                request.addOption("--concurrent-fragments", connections.toString())
+                request.addOption("--http-chunk-size", "10485760")
+            }
+            request.addOption("--buffer-size", "1048576")
+        }
+        if (speedLimitKbps > 0) {
+            request.addOption("--limit-rate", (speedLimitKbps * 1024).toString())
+        }
         request.addOption("--paths", "home:${outDir.absolutePath}")
         request.addOption("-o", template)
         // No --windows-filenames here: it makes yt-dlp replace every
