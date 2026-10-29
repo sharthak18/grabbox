@@ -268,6 +268,7 @@ async function analyze(url) {
   $("#rOkWrap").classList.add("hidden");
   $("#rErrWrap").classList.add("hidden");
   $("#rPlaylist").classList.add("hidden");
+  $("#rArchive").classList.add("hidden");
   $("#rDownload").disabled = true;
   $("#rSize").textContent = "";
 
@@ -315,6 +316,17 @@ async function analyze(url) {
       `<li><span class="idx">${String(i + 1).padStart(2, "0")}</span><span>${escapeHtml(e.title || e.url || "")}</span></li>`
     ).join("");
     $("#rPlaylist").classList.remove("hidden");
+  }
+
+  const zipEntries = res.archive_entries || [];
+  if (zipEntries.length) {
+    const shown = zipEntries.slice(0, 25);
+    $("#rArchiveList").innerHTML = shown.map((e, i) =>
+      `<li><span class="idx">${String(i + 1).padStart(2, "0")}</span><span>${escapeHtml(e.name || "")}${e.size ? " · " + fmtBytes(e.size) : ""}</span></li>`
+    ).join("") + (zipEntries.length > shown.length
+      ? `<li><span class="idx">…</span><span>and ${zipEntries.length - shown.length} more files</span></li>`
+      : "");
+    $("#rArchive").classList.remove("hidden");
   }
 }
 

@@ -285,6 +285,23 @@ private fun ProbeCard(vm: GrabViewModel, p: Engine.ProbeInfo) {
                         Text(meta, style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
+                    if (p.archiveEntries.isNotEmpty()) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "🗜 Inside: ${p.archiveEntries.size} files (peeked, not downloaded)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        p.archiveEntries.take(5).forEach { e ->
+                            Text(
+                                "· ${e.name}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
                 }
             }
 

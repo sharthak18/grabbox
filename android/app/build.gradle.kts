@@ -15,8 +15,8 @@ android {
         // youtubedl-android 0.18.1 requires Android 7.0/API 24.
         minSdk = 24
         targetSdk = 34
-        versionCode = 200
-        versionName = "0.2.0"
+        versionCode = 300
+        versionName = "0.3.0"
         vectorDrawables { useSupportLibrary = true }
     }
 

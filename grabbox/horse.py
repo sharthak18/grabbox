@@ -15,7 +15,15 @@ This module is that move, with the never-dies half built in:
 * the validator (size + ETag / Last-Modified) is checked before a resume,
   so a changed file restarts cleanly instead of gluing two versions;
 * servers without Range support get an honest single stream that still
-  resumes by appending when it can.
+  resumes by appending when it can;
+* responses are validated — an HTML error page is never saved under a
+  media name, and a 206 whose ``Content-Range`` disagrees with the
+  request is rejected instead of written at the wrong offset;
+* expired signed links (403/410 mid-download) are re-resolved from the
+  original URL and the download continues from the same segment map —
+  bytes already on disk are kept, never restarted;
+* the engine heals itself: connections that stall are reopened, and
+  429/503 answers halve the connection count instead of failing.
 
 Stdlib only, like the rest of the core. Used by ``downloader.Manager`` for
 direct files; yt-dlp (with concurrent fragments) handles everything else.
@@ -35,6 +43,12 @@ CHUNK = 256 * 1024            # per-connection read/write block
 MIN_SEGMENT = 512 * 1024      # don't slice thinner than this
 SPLIT_MIN = 256 * 1024        # smallest slice worth stealing from a slow
                               # connection (see _download_segmented)
+#: A connection that delivers no new bytes for this long is reopened
+#: (self-healing: a trickling connection must not hold a segment hostage
+#: while honest ones sit idle). Tests shrink this.
+STALL_SECONDS = 20.0
+#: How many times an expired (403/410) link may be re-resolved mid-download.
+MAX_REFRESHES = 2
 STATE_SUFFIX = ".horse.json"
 PART_SUFFIX = ".part"
 
@@ -126,6 +140,26 @@ def _request(url, headers, byte_range=None):
     return urllib.request.Request(url, headers=hdrs)
 
 
+def _looks_like_html(first_bytes):
+    """True when the body's first bytes are plainly an HTML page."""
+    head = (first_bytes or b"").lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    return head.startswith((b"<!doctype", b"<html", b"<head", b"<body"))
+
+
+def _parse_content_range(value):
+    """'bytes 100-199/1234' -> (100, 199, 1234); total may be None ('*')."""
+    try:
+        unit, rest = value.strip().split(None, 1)
+        if unit.lower() != "bytes":
+            return None
+        span, _, total = rest.partition("/")
+        start_s, _, end_s = span.partition("-")
+        return (int(start_s), int(end_s),
+                int(total) if total.strip().isdigit() else None)
+    except (ValueError, AttributeError):
+        return None
+
+
 def probe_ranges(url, headers=None, timeout=30):
     """
     One 1-byte ranged GET tells us everything: total size, whether ranges
@@ -133,6 +167,7 @@ def probe_ranges(url, headers=None, timeout=30):
 
     Returns dict(size, ranges, etag, last_modified, final_url, status).
     """
+    first_bytes = b""
     try:
         req = _request(url, headers, (0, 0))
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -140,7 +175,7 @@ def probe_ranges(url, headers=None, timeout=30):
             hdrs = resp.headers
             final_url = resp.geturl()
             try:
-                resp.read(1024)
+                first_bytes = resp.read(1024) or b""
             except Exception:
                 pass
     except urllib.error.HTTPError as exc:
@@ -163,6 +198,11 @@ def probe_ranges(url, headers=None, timeout=30):
     ranges = status == 206 or "bytes" in (hdrs.get("Accept-Ranges") or "")
     ctype = (hdrs.get("Content-Type") or "").lower()
     if status == 200 and ctype.startswith("text/html") and size is None:
+        raise HorseFallback("server returned a web page, not a file")
+    if status == 200 and _looks_like_html(first_bytes):
+        # Magic-byte check, DownloadCraft's rule: an error page with a
+        # lying Content-Type (or a Content-Length) is still an error
+        # page. Never save it under a media/file name.
         raise HorseFallback("server returned a web page, not a file")
     return {"size": size, "ranges": bool(ranges),
             "etag": hdrs.get("ETag"),
@@ -231,11 +271,15 @@ def download(url, dest, connections=8, rate_limit_bps=0, headers=None,
     info = probe_ranges(url, headers=headers, timeout=timeout)
     if info["status"] and info["status"] >= 400:
         raise HorseError("HTTP %s" % info["status"])
+    # Segments fetch the URL the probe landed on (redirects resolved
+    # once, not per request). `url` stays the source: re-resolving it is
+    # how an expired signed link gets refreshed below.
+    current = info.get("final_url") or url
 
     work = dest + PART_SUFFIX
     state_file = _State(dest + STATE_SUFFIX)
     saved = state_file.load()
-    resume = _valid_resume(saved, url, info) and os.path.exists(work)
+    resume = _valid_resume(saved, current, info) and os.path.exists(work)
     if not resume:
         state_file.drop()
         saved = None
@@ -246,16 +290,52 @@ def download(url, dest, connections=8, rate_limit_bps=0, headers=None,
 
     if info["size"] is not None and info["ranges"] and connections > 1 \
             and info["size"] >= MIN_SEGMENT * 2:
-        try:
-            return _download_segmented(url, dest, work, state_file, saved,
-                                       info, connections, rate_limit_bps,
-                                       headers, should_stop, progress,
-                                       timeout)
-        except _RangeIgnored:
-            saved = None  # ranged claims were a lie; start the stream clean
-    return _download_single(url, dest, work, state_file, saved, info,
+        refreshes = 0
+        while True:
+            try:
+                return _download_segmented(current, dest, work, state_file,
+                                           saved, info, connections,
+                                           rate_limit_bps, headers,
+                                           should_stop, progress, timeout)
+            except _RangeIgnored:
+                saved = None  # ranged claims were a lie; start clean
+                break
+            except _LinkExpired:
+                refreshes += 1
+                if refreshes > MAX_REFRESHES:
+                    raise HorseError(
+                        "link expired and could not be refreshed")
+                current, saved = _refresh(url, current, info, state_file,
+                                          headers, timeout)
+    return _download_single(current, dest, work, state_file, saved, info,
                             rate_limit_bps, headers, should_stop, progress,
                             timeout)
+
+
+def _refresh(source_url, old_url, orig_info, state_file, headers, timeout):
+    """
+    Re-resolve the source URL after a 403/410. Returns (new_url, saved)
+    with the segment map re-pointed at the new URL — but only when the
+    fresh probe describes the *same file* (same size, non-conflicting
+    validators), so bytes already on disk stay valid.
+    """
+    fresh = probe_ranges(source_url, headers=headers, timeout=timeout)
+    new_url = fresh.get("final_url") or source_url
+    if fresh["status"] and fresh["status"] >= 400:
+        raise HorseError("link expired (HTTP %s)" % fresh["status"])
+    if new_url == old_url:
+        raise HorseError("link expired (HTTP 403) and re-resolving "
+                         "the source gave the same URL")
+    if fresh["size"] != orig_info["size"]:
+        raise HorseError("refreshed link points at a different file")
+    for key in ("etag", "last_modified"):
+        if orig_info.get(key) and fresh.get(key) \
+                and orig_info[key] != fresh[key]:
+            raise HorseError("refreshed link points at a different file")
+    saved = state_file.load()
+    if saved:
+        saved["url"] = new_url
+    return new_url, saved
 
 
 def _check_stop(should_stop):
@@ -313,7 +393,10 @@ def _download_segmented(url, dest, work, state_file, saved, info, connections,
     speeds = {}            # worker -> EMA bytes/sec
     speed_bytes = {}       # worker -> [bytes at last sample, monotonic t]
     failure = []
-    throttled = {"hit": False}
+    # Self-healing: how many connections may fly at once. A 429/503
+    # halves it; `active` counts claims in flight right now.
+    cap = {"n": max(1, connections), "active": 0}
+    WAIT = object()        # claim() sentinel: work exists, cap reached
 
     def persist():
         with lock:
@@ -336,20 +419,28 @@ def _download_segmented(url, dest, work, state_file, saved, info, connections,
         return speeds.get(worker, 0.0)
 
     def claim(worker):
-        """Take orphaned work, or split the segment finishing last."""
+        """Take orphaned work, or split the segment finishing last.
+
+        Returns a segment, WAIT (work remains but the connection cap is
+        full — park briefly), or None (nothing left to do).
+        """
         with lock:
+            unfinished = any(s["end"] - s["pos"] > 0 for s in segments)
+            if unfinished and cap["active"] >= cap["n"]:
+                return WAIT
             orphans = [s for s in segments
                        if s["owner"] is None and s["end"] - s["pos"] > 0]
             if orphans:
                 s = max(orphans,
                         key=lambda s: (s["end"] - s["pos"], -s["start"]))
                 s["owner"] = worker
+                cap["active"] += 1
                 return s
             owned = [s for s in segments
                      if s["owner"] is not None
                      and s["end"] - s["pos"] >= 2 * SPLIT_MIN]
             if not owned:
-                return None
+                return None if not unfinished else WAIT
 
             def eta(s):
                 v = speed_of(s["owner"])
@@ -375,6 +466,7 @@ def _download_segmented(url, dest, work, state_file, saved, info, connections,
                    "owner": worker, "fails": 0}
             s["end"] = mid
             segments.append(new)
+            cap["active"] += 1
             return new
 
     def run_claim(worker, seg):
@@ -386,14 +478,31 @@ def _download_segmented(url, dest, work, state_file, saved, info, connections,
             # urllib raises for every non-2xx; translate the interesting ones.
             if exc.code in (429, 503):
                 raise _Throttled("HTTP %s" % exc.code)
+            if exc.code in (403, 410):
+                raise _LinkExpired("HTTP %s" % exc.code)
             if exc.code == 416:
                 raise HorseError("range not satisfiable (HTTP 416)")
             raise HorseError("HTTP %s" % exc.code)
         with resp_ctx as resp:
+            if resp.status in (403, 410):
+                raise _LinkExpired("HTTP %s" % resp.status)
             if resp.status != 206:
                 raise _RangeIgnored("server ignored Range (HTTP %s)"
                                     % resp.status)
+            crange = _parse_content_range(resp.headers.get("Content-Range")
+                                          or "")
+            if crange is not None:
+                # Validation: the bytes must start where we asked, and
+                # belong to the file we probed — never write a misaligned
+                # or foreign body at a good file's offsets.
+                if crange[0] != frm:
+                    raise HorseError(
+                        "server sent the wrong range (asked %d, got %d)"
+                        % (frm, crange[0]))
+                if crange[2] is not None and crange[2] != size:
+                    raise HorseError("file changed mid-download")
             with open(work, "r+b") as fh:
+                last_advance = time.monotonic()
                 while True:
                     _check_stop(should_stop)
                     with lock:
@@ -403,6 +512,11 @@ def _download_segmented(url, dest, work, state_file, saved, info, connections,
                     block = resp.read(min(CHUNK, end - pos))
                     if not block:
                         raise HorseError("connection dropped mid-segment")
+                    if time.monotonic() - last_advance > STALL_SECONDS:
+                        # Self-healing: bytes stopped arriving on an open
+                        # connection. Reopen it (a segment retry) instead
+                        # of letting it hold the whole download hostage.
+                        raise HorseError("connection stalled — reopening")
                     with lock:
                         # Our bound may have shrunk (a split) mid-read:
                         # only the bytes up to the current end are ours.
@@ -410,6 +524,7 @@ def _download_segmented(url, dest, work, state_file, saved, info, connections,
                         if allowed:
                             seg["pos"] = pos + allowed
                     if allowed:
+                        last_advance = time.monotonic()
                         limiter.take(allowed)
                         fh.seek(pos)
                         fh.write(block[:allowed])
@@ -422,36 +537,49 @@ def _download_segmented(url, dest, work, state_file, saved, info, connections,
                     if allowed < len(block):
                         return   # shrunk past the stream; segment done
 
+    def release(seg):
+        with lock:
+            seg["owner"] = None
+            cap["active"] = max(0, cap["active"] - 1)
+
     def worker_loop(worker):
         try:
             while True:
+                with lock:
+                    if failure:
+                        return   # a sibling already decided this download
                 seg = claim(worker)
                 if seg is None:
                     return
+                if seg is WAIT:
+                    time.sleep(0.1)  # cap full or owners busy; stay ready
+                    continue
                 try:
                     run_claim(worker, seg)
-                    with lock:
-                        seg["owner"] = None
                 except _Throttled:
-                    throttled["hit"] = True
+                    release(seg)
                     with lock:
-                        seg["owner"] = None
-                    time.sleep(2)      # 429/503: ease off, keep the bytes
-                except (HorsePaused, _RangeIgnored):
+                        # 429/503: the server asked for fewer of us.
+                        cap["n"] = max(1, cap["n"] // 2)
+                    time.sleep(2)      # ease off, keep the bytes
+                except (HorsePaused, _RangeIgnored, _LinkExpired):
+                    release(seg)
                     raise
                 except HorseError:
+                    release(seg)
                     if should_stop and should_stop():
                         raise
                     with lock:
-                        seg["owner"] = None
                         seg["fails"] += 1
-                        if seg["fails"] >= 6 and not failure:
+                        bad = seg["fails"] >= 6
+                        if bad and not failure:
                             failure.append(HorseError(
                                 "segment failed repeatedly"))
-                            return
+                    if bad:
+                        return
                 except Exception as exc:  # dropped socket, timeout, ...
+                    release(seg)
                     with lock:
-                        seg["owner"] = None
                         seg["fails"] += 1
                         bad = seg["fails"] >= 6
                     if bad:
@@ -459,6 +587,8 @@ def _download_segmented(url, dest, work, state_file, saved, info, connections,
                             if not failure:
                                 failure.append(HorseError(str(exc)))
                         return
+                else:
+                    release(seg)
         except BaseException as exc:  # noqa: BLE001 - re-raised on join
             with lock:
                 if not failure:
@@ -485,6 +615,12 @@ def _download_segmented(url, dest, work, state_file, saved, info, connections,
 
 class _Throttled(HorseError):
     """429/503: back off and retry the segment — never a hard failure."""
+
+
+class _LinkExpired(HorseError):
+    """403/410 mid-download: the (usually signed) URL went stale.
+    download() re-resolves the source URL and continues the same
+    segment map under the fresh URL — bytes are kept."""
 
 
 def _state_dict(url, info, segments):
@@ -514,30 +650,51 @@ def _download_single(url, dest, work, state_file, saved, info,
     prog = _Progress(size, have, progress)
     prog.push(force=True)
     limiter = _RateLimiter(rate_limit_bps)
+
+    def pump(resp, fh):
+        nonlocal have
+        while True:
+            _check_stop(should_stop)
+            block = resp.read(CHUNK)
+            if not block:
+                break
+            limiter.take(len(block))
+            fh.write(block)
+            have += len(block)
+            prog.add(len(block))
+            prog.push()
+            state_file.save({
+                "url": url, "size": size, "etag": info.get("etag"),
+                "last_modified": info.get("last_modified"),
+                "segments": [{"start": 0, "end": size or have,
+                              "done": have}],
+            })
+
     try:
         req = _request(url, headers, byte_range)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if byte_range and resp.status != 206:
-                have = 0                      # server ignored our resume point
+            untrusted = False
+            if byte_range:
+                crange = _parse_content_range(
+                    resp.headers.get("Content-Range") or "")
+                if resp.status != 206:
+                    untrusted = True   # server ignored our resume point
+                elif crange is not None and crange[0] != have:
+                    untrusted = True   # bytes start somewhere else entirely
+            if untrusted:
+                have = 0
                 prog.done = 0
-            mode = "ab" if have else "wb"
-            with open(work, mode) as fh:
-                while True:
-                    _check_stop(should_stop)
-                    block = resp.read(CHUNK)
-                    if not block:
-                        break
-                    limiter.take(len(block))
-                    fh.write(block)
-                    have += len(block)
-                    prog.add(len(block))
-                    prog.push()
-                    state_file.save({
-                        "url": url, "size": size, "etag": info.get("etag"),
-                        "last_modified": info.get("last_modified"),
-                        "segments": [{"start": 0, "end": size or have,
-                                      "done": have}],
-                    })
+            else:
+                mode = "ab" if have else "wb"
+                with open(work, mode) as fh:
+                    pump(resp, fh)
+        if untrusted:
+            # Fresh, honest stream from byte 0 — the response above was
+            # discarded unread rather than glued onto our prefix.
+            req = _request(url, headers, None)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with open(work, "wb") as fh:
+                    pump(resp, fh)
     except (HorsePaused, HorseError):
         raise
     except Exception as exc:

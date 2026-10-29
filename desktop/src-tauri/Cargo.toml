@@ -1,6 +1,6 @@
 [package]
 name = "grabbox-desktop"
-version = "0.2.0"
+version = "0.3.0"
 description = "GrabBox — grab anything from the web, keep it local"
 authors = ["GrabBox"]
 license = "MIT"

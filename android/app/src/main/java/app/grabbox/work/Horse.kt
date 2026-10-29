@@ -36,9 +36,13 @@ object Horse {
     private const val CHUNK = 256 * 1024        // per-connection read/write block
     private const val MIN_SEGMENT = 512L * 1024 // don't slice thinner than this
     private const val SPLIT_MIN = 256L * 1024   // smallest slice worth stealing
+    private const val MAX_REFRESHES = 2         // expired-link re-resolutions
     private const val STATE_SUFFIX = ".horse.json"
     private const val PART_SUFFIX = ".part"
     private const val TIMEOUT_MS = 30_000
+
+    /** A connection that delivers no new bytes for this long is reopened. */
+    var stallSeconds: Double = 20.0
 
     /** Download failed; the .part + state stay on disk so a retry resumes. */
     open class HorseError(message: String) : Exception(message)
@@ -54,6 +58,48 @@ object Horse {
 
     /** 429/503: back off and retry the segment — never a hard failure. */
     private class Throttled : HorseError("throttled")
+
+    /**
+     * 403/410 mid-download: the (usually signed) URL went stale.
+     * download() re-resolves the source URL and continues the same
+     * segment map under the fresh URL — bytes are kept.
+     */
+    private class LinkExpired : HorseError("link expired")
+
+    /** 'bytes 100-199/1234' -> (100, 199, 1234); total null when '*'. */
+    private fun parseContentRange(value: String?): Triple<Long, Long, Long?>? {
+        if (value == null) return null
+        return try {
+            val v = value.trim()
+            val sp = v.indexOf(' ')
+            if (sp < 0 || !v.substring(0, sp).equals("bytes", ignoreCase = true)) {
+                return null
+            }
+            val rest = v.substring(sp + 1)
+            val span = rest.substringBefore('/')
+            val total = rest.substringAfter('/', "").trim()
+            val start = span.substringBefore('-').trim().toLong()
+            val end = span.substringAfter('-').trim().toLong()
+            Triple(start, end, total.toLongOrNull())
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** True when the body's first bytes are plainly an HTML page. */
+    private fun looksLikeHtml(first: ByteArray): Boolean {
+        var i = 0
+        if (first.size >= 3 && first[0] == 0xEF.toByte() &&
+            first[1] == 0xBB.toByte() && first[2] == 0xBF.toByte()
+        ) {
+            i = 3 // UTF-8 BOM
+        }
+        while (i < first.size && first[i].toInt().toChar() in " \t\r\n") i++
+        val head = String(first, i, min(9, first.size - i), Charsets.US_ASCII)
+            .lowercase()
+        return head.startsWith("<!doctype") || head.startsWith("<html") ||
+            head.startsWith("<head") || head.startsWith("<body")
+    }
 
     // ------------------------------------------------------------ plumbing --
 
@@ -164,6 +210,7 @@ object Horse {
         val etag: String?,
         val lastModified: String?,
         val status: Int,
+        val finalUrl: String,
     )
 
     private fun stateLoad(file: File): StateJson? = try {
@@ -235,8 +282,9 @@ object Horse {
         try {
             val status = conn.responseCode
             if (status >= 400) {
-                return ProbeInfo(null, false, null, null, status)
+                return ProbeInfo(null, false, null, null, status, url)
             }
+            val finalUrl = conn.url.toString()
             var size: Long? = null
             val crange = conn.getHeaderField("Content-Range")
             if (crange != null && '/' in crange) {
@@ -248,13 +296,22 @@ object Horse {
             val ranges = status == 206 ||
                 (conn.getHeaderField("Accept-Ranges") ?: "").contains("bytes")
             val ctype = (conn.getHeaderField("Content-Type") ?: "").lowercase()
-            // Drain a byte so the connection can close cleanly.
+            // Keep the first bytes: enough to sniff an HTML error page
+            // out from behind a lying Content-Type before saving any.
+            var firstBytes = ByteArray(0)
             try {
-                conn.inputStream.read(ByteArray(1024))
+                val buf = ByteArray(1024)
+                val got = conn.inputStream.read(buf)
+                if (got > 0) firstBytes = buf.copyOf(got)
             } catch (e: Exception) {
                 // The headers already told us everything.
             }
             if (status == 200 && ctype.startsWith("text/html") && size == null) {
+                throw HorseFallback("server returned a web page, not a file")
+            }
+            if (status == 200 && looksLikeHtml(firstBytes)) {
+                // Magic-byte check, DownloadCraft's rule: an error page
+                // is an error page even with a Content-Length set.
                 throw HorseFallback("server returned a web page, not a file")
             }
             return ProbeInfo(
@@ -263,6 +320,7 @@ object Horse {
                 etag = conn.getHeaderField("ETag"),
                 lastModified = conn.getHeaderField("Last-Modified"),
                 status = status,
+                finalUrl = finalUrl,
             )
         } catch (e: HorseFallback) {
             throw e
@@ -293,11 +351,15 @@ object Horse {
         val conns = connections.coerceIn(1, 16)
         val info = probeRanges(url)
         if (info.status >= 400) throw HorseError("HTTP ${info.status}")
+        // Segments fetch the URL the probe landed on (redirects resolved
+        // once, not per request). `url` stays the source: re-resolving it
+        // is how an expired signed link gets refreshed below.
+        var current = info.finalUrl.ifEmpty { url }
 
         val work = File(dest.path + PART_SUFFIX)
         val stateFile = File(dest.path + STATE_SUFFIX)
         var saved = stateLoad(stateFile)
-        val resume = saved != null && validResume(saved, url, info) && work.exists()
+        val resume = saved != null && validResume(saved, current, info) && work.exists()
         if (!resume) {
             stateFile.delete()
             saved = null
@@ -306,18 +368,65 @@ object Horse {
 
         val size = info.size
         if (size != null && info.ranges && conns > 1 && size >= MIN_SEGMENT * 2) {
-            try {
-                return downloadSegmented(
-                    url, dest, work, stateFile, saved, info, size, conns,
-                    rateLimitBps, shouldStop, progress,
-                )
-            } catch (e: RangeIgnored) {
-                saved = null // ranged claims were a lie; start the stream clean
+            var refreshes = 0
+            while (true) {
+                try {
+                    return downloadSegmented(
+                        current, dest, work, stateFile, saved, info, size, conns,
+                        rateLimitBps, shouldStop, progress,
+                    )
+                } catch (e: RangeIgnored) {
+                    saved = null // ranged claims were a lie; start the stream clean
+                    break
+                } catch (e: LinkExpired) {
+                    refreshes++
+                    if (refreshes > MAX_REFRESHES) {
+                        throw HorseError("link expired and could not be refreshed")
+                    }
+                    val (newUrl, newSaved) = refresh(url, current, info, stateFile)
+                    current = newUrl
+                    saved = newSaved
+                }
             }
         }
         return downloadSingle(
-            url, dest, work, stateFile, saved, info, rateLimitBps, shouldStop, progress,
+            current, dest, work, stateFile, saved, info, rateLimitBps, shouldStop, progress,
         )
+    }
+
+    /**
+     * Re-resolve the source URL after a 403/410. Returns the fresh URL
+     * and the segment map re-pointed at it — but only when the fresh
+     * probe describes the *same file* (same size, non-conflicting
+     * validators), so bytes already on disk stay valid.
+     */
+    private fun refresh(
+        sourceUrl: String,
+        oldUrl: String,
+        origInfo: ProbeInfo,
+        stateFile: File,
+    ): Pair<String, StateJson?> {
+        val fresh = probeRanges(sourceUrl)
+        if (fresh.status >= 400) throw HorseError("link expired (HTTP ${fresh.status})")
+        val newUrl = fresh.finalUrl.ifEmpty { sourceUrl }
+        if (newUrl == oldUrl) {
+            throw HorseError(
+                "link expired (HTTP 403) and re-resolving the source gave the same URL"
+            )
+        }
+        if (fresh.size != origInfo.size) {
+            throw HorseError("refreshed link points at a different file")
+        }
+        if (origInfo.etag != null && fresh.etag != null && origInfo.etag != fresh.etag) {
+            throw HorseError("refreshed link points at a different file")
+        }
+        if (origInfo.lastModified != null && fresh.lastModified != null &&
+            origInfo.lastModified != fresh.lastModified
+        ) {
+            throw HorseError("refreshed link points at a different file")
+        }
+        val saved = stateLoad(stateFile)?.copy(url = newUrl)
+        return newUrl to saved
     }
 
     // ---------------------------------------------------------- segmented --
@@ -341,6 +450,20 @@ object Horse {
         val speeds = mutableMapOf<Int, Double>()          // worker -> EMA bytes/sec
         val speedBytes = mutableMapOf<Int, Pair<Long, Double>>()
         var failure: HorseError? = null
+
+        // Self-healing: how many connections may fly at once (a 429/503
+        // halves it) and how many claims are in flight right now.
+        var cap: Int = 1
+        var active: Int = 0
+
+        /** claim() sentinel: work remains but the connection cap is full. */
+        val waitSentinel = Segment(-1, -1, -1)
+
+        /** Hand a segment back and free its connection slot. */
+        fun release(seg: Segment) = synchronized(lock) {
+            seg.owner = null
+            if (active > 0) active--
+        }
 
         fun persist() {
             val rows = synchronized(lock) {
@@ -372,18 +495,25 @@ object Horse {
 
         /** Take orphaned work, or split the segment finishing last. */
         fun claim(worker: Int): Segment? = synchronized(lock) {
+            val unfinished = segments.any { it.end > it.pos }
+            if (unfinished && active >= cap) {
+                return@synchronized waitSentinel // cap full — park, stay ready
+            }
             val orphans = segments.filter { it.owner == null && it.end > it.pos }
             if (orphans.isNotEmpty()) {
                 val s = orphans.maxWithOrNull(
                     compareBy<Segment> { it.end - it.pos }.thenByDescending { it.start }
                 )!!
                 s.owner = worker
+                active++
                 return@synchronized s
             }
             val owned = segments.filter {
                 it.owner != null && it.end - it.pos >= 2 * SPLIT_MIN
             }
-            if (owned.isEmpty()) return@synchronized null
+            if (owned.isEmpty()) {
+                return@synchronized if (unfinished) waitSentinel else null
+            }
 
             fun eta(s: Segment): Double {
                 val v = speeds[s.owner] ?: 0.0
@@ -414,6 +544,7 @@ object Horse {
             fresh.owner = worker
             s.end = mid
             segments.add(fresh)
+            active++
             fresh
         }
     }
@@ -458,6 +589,7 @@ object Horse {
             limiter = RateLimiter(rateLimitBps),
             shouldStop = shouldStop,
         )
+        sh.cap = max(1, connections)
         sh.prog.push(force = true)
 
         val threads = (0 until max(1, connections)).map { wid ->
@@ -483,16 +615,28 @@ object Horse {
 
     private fun workerLoop(sh: Shared, work: File, wid: Int) {
         while (true) {
+            synchronized(sh.lock) {
+                if (sh.failure != null) return // a sibling already decided
+            }
             val seg = sh.claim(wid) ?: return
+            if (seg === sh.waitSentinel) {
+                Thread.sleep(100) // cap full or owners busy; stay ready
+                continue
+            }
             try {
                 runClaim(sh, work, wid, seg)
-                synchronized(sh.lock) { seg.owner = null }
+                sh.release(seg)
             } catch (e: Throttled) {
-                synchronized(sh.lock) { seg.owner = null }
-                Thread.sleep(2000) // 429/503: ease off, keep the bytes
+                sh.release(seg)
+                synchronized(sh.lock) {
+                    // 429/503: the server asked for fewer of us.
+                    sh.cap = max(1, sh.cap / 2)
+                }
+                Thread.sleep(2000) // ease off, keep the bytes
             } catch (e: HorseError) {
+                sh.release(seg)
                 when (e) {
-                    is HorsePaused, is RangeIgnored -> {
+                    is HorsePaused, is RangeIgnored, is LinkExpired, is HorseFallback -> {
                         sh.recordFailure(e)
                         return
                     }
@@ -508,7 +652,6 @@ object Horse {
                             }
                         }
                         val bad = synchronized(sh.lock) {
-                            seg.owner = null
                             seg.fails += 1
                             seg.fails >= 6
                         }
@@ -519,6 +662,7 @@ object Horse {
                     }
                 }
             } catch (e: Exception) {
+                sh.release(seg)
                 when (sh.shouldStop?.invoke()) {
                     "pause" -> {
                         sh.recordFailure(HorsePaused())
@@ -530,7 +674,6 @@ object Horse {
                     }
                 }
                 val bad = synchronized(sh.lock) {
-                    seg.owner = null
                     seg.fails += 1
                     seg.fails >= 6
                 }
@@ -548,13 +691,31 @@ object Horse {
         try {
             when (val code = conn.responseCode) {
                 429, 503 -> throw Throttled()
+                403, 410 -> throw LinkExpired()
                 416 -> throw HorseError("range not satisfiable (HTTP 416)")
                 else -> if (code >= 400) throw HorseError("HTTP $code")
             }
             if (conn.responseCode != 206) throw RangeIgnored()
+            // Validation: the bytes must start where we asked, and
+            // belong to the file we probed — never write a misaligned
+            // or foreign body at a good file's offsets.
+            val crange = parseContentRange(conn.getHeaderField("Content-Range"))
+            if (crange != null) {
+                if (crange.first != frm) {
+                    throw HorseError(
+                        "server sent the wrong range (asked $frm, got ${crange.first})"
+                    )
+                }
+                val total = crange.third
+                val sz = sh.info.size
+                if (total != null && sz != null && total != sz) {
+                    throw HorseError("file changed mid-download")
+                }
+            }
             val stream: InputStream = conn.inputStream
             RandomAccessFile(work, "rw").use { fh ->
                 val buf = ByteArray(CHUNK)
+                var lastAdvance = nowSec()
                 while (true) {
                     checkStop(sh.shouldStop)
                     val (pos, end) = synchronized(sh.lock) { seg.pos to seg.end }
@@ -563,6 +724,12 @@ object Horse {
                     val n = stream.read(buf, 0, want)
                     if (n < 0) throw HorseError("connection dropped mid-segment")
                     if (n == 0) continue
+                    if (nowSec() - lastAdvance > stallSeconds) {
+                        // Self-healing: bytes stopped arriving on an open
+                        // connection. Reopen it (a segment retry) instead
+                        // of letting it hold the download hostage.
+                        throw HorseError("connection stalled — reopening")
+                    }
                     // Our bound may have shrunk (a split) mid-read: only
                     // the bytes up to the current end are ours.
                     val allowed = synchronized(sh.lock) {
@@ -571,6 +738,7 @@ object Horse {
                         a
                     }
                     if (allowed > 0) {
+                        lastAdvance = nowSec()
                         sh.limiter.take(allowed)
                         fh.seek(pos)
                         fh.write(buf, 0, allowed)
@@ -620,17 +788,10 @@ object Horse {
         prog.push(force = true)
         val limiter = RateLimiter(rateLimitBps)
 
-        val conn = open(url, byteRange)
-        try {
-            val code = conn.responseCode
-            if (code >= 400) throw HorseError("HTTP $code")
-            if (byteRange != null && code != 206) {
-                have = 0 // server ignored our resume point
-                prog.setDone(0)
-            }
+        fun pump(conn: HttpURLConnection, append: Boolean) {
             val stream = conn.inputStream
             RandomAccessFile(work, "rw").use { fh ->
-                if (have > 0) {
+                if (append) {
                     fh.seek(have)
                 } else {
                     fh.setLength(0)
@@ -651,6 +812,39 @@ object Horse {
                         stateDict(url, info, listOf(SegRow(0, size ?: have, have))),
                     )
                 }
+            }
+        }
+
+        val conn = open(url, byteRange)
+        try {
+            val code = conn.responseCode
+            if (code >= 400) throw HorseError("HTTP $code")
+            // Validate the resume before trusting a byte of it: a 200
+            // (Range ignored) or a 206 starting anywhere else would
+            // glue wrong bytes onto our good prefix.
+            var untrusted = false
+            if (byteRange != null) {
+                val crange = parseContentRange(conn.getHeaderField("Content-Range"))
+                if (code != 206 || (crange != null && crange.first != have)) {
+                    untrusted = true
+                }
+            }
+            if (untrusted) {
+                have = 0
+                prog.setDone(0)
+                conn.disconnect()
+                // Fresh, honest stream from byte 0 — the response above
+                // was discarded unread rather than glued onto our prefix.
+                val fresh = open(url, null)
+                try {
+                    val code2 = fresh.responseCode
+                    if (code2 >= 400) throw HorseError("HTTP $code2")
+                    pump(fresh, append = false)
+                } finally {
+                    fresh.disconnect()
+                }
+            } else {
+                pump(conn, append = have > 0)
             }
         } catch (e: HorseError) {
             throw e

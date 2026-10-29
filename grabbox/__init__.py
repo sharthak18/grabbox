@@ -9,5 +9,5 @@ _VENDOR = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__fil
 if _os.path.isdir(_VENDOR) and _VENDOR not in _sys.path:
     _sys.path.insert(0, _VENDOR)
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = ["__version__"]
