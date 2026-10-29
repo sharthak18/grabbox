@@ -350,7 +350,7 @@ object Horse {
             stateSave(stateFile, stateDict(url, info, rows))
         }
 
-        fun setFailure(e: HorseError) = synchronized(lock) {
+        fun recordFailure(e: HorseError) = synchronized(lock) {
             if (failure == null) failure = e
         }
 
@@ -493,17 +493,17 @@ object Horse {
             } catch (e: HorseError) {
                 when (e) {
                     is HorsePaused, is RangeIgnored -> {
-                        sh.setFailure(e)
+                        sh.recordFailure(e)
                         return
                     }
                     else -> {
                         when (sh.shouldStop?.invoke()) {
                             "pause" -> {
-                                sh.setFailure(HorsePaused())
+                                sh.recordFailure(HorsePaused())
                                 return
                             }
                             "cancel" -> {
-                                sh.setFailure(HorseError("canceled"))
+                                sh.recordFailure(HorseError("canceled"))
                                 return
                             }
                         }
@@ -513,7 +513,7 @@ object Horse {
                             seg.fails >= 6
                         }
                         if (bad) {
-                            sh.setFailure(e)
+                            sh.recordFailure(e)
                             return
                         }
                     }
@@ -521,11 +521,11 @@ object Horse {
             } catch (e: Exception) {
                 when (sh.shouldStop?.invoke()) {
                     "pause" -> {
-                        sh.setFailure(HorsePaused())
+                        sh.recordFailure(HorsePaused())
                         return
                     }
                     "cancel" -> {
-                        sh.setFailure(HorseError("canceled"))
+                        sh.recordFailure(HorseError("canceled"))
                         return
                     }
                 }
@@ -535,7 +535,7 @@ object Horse {
                     seg.fails >= 6
                 }
                 if (bad) {
-                    sh.setFailure(HorseError(e.message ?: "segment failed"))
+                    sh.recordFailure(HorseError(e.message ?: "segment failed"))
                     return
                 }
             }

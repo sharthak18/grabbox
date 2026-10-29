@@ -580,9 +580,8 @@ fn run_claim(sh: &Shared, agent: &Agent, worker: usize, idx: usize, work: &Path)
         let g = sh.inner.lock().unwrap();
         g.segments[idx].end
     };
-    let req = agent
-        .get(&sh.url)
-        .set("Range", format!("bytes={}-{}", frm, end0.saturating_sub(1)));
+    let range = format!("bytes={}-{}", frm, end0.saturating_sub(1));
+    let req = agent.get(&sh.url).set("Range", &range);
     let resp = match req.call() {
         Ok(r) => r,
         Err(ureq::Error::Status(429, _)) | Err(ureq::Error::Status(503, _)) => {
@@ -835,7 +834,8 @@ fn download_single(
 
     let mut req = agent.get(url);
     if let Some((a, b)) = byte_range {
-        req = req.set("Range", format!("bytes={}-{}", a, b));
+        let range = format!("bytes={}-{}", a, b);
+        req = req.set("Range", &range);
     }
     let resp = match req.call() {
         Ok(r) => r,
