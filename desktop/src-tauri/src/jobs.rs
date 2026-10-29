@@ -189,6 +189,15 @@ impl Sem {
     }
 }
 
+/// How a native horse attempt ended (anything but Done means the worker
+/// either stops on purpose or falls through to the yt-dlp ladder).
+enum HorseOutcome {
+    Done(String),
+    Paused,
+    Canceled,
+    Fallback,
+}
+
 #[derive(Clone)]
 pub struct JobHandle {
     state: Arc<Mutex<JobState>>,
@@ -520,6 +529,125 @@ impl Manager {
 
     // ------------------------------------------------------------ worker --
 
+    /// One native horse attempt for a direct file. Mirrors the Python
+    /// core's `_run_horse`: sniff decides the filename, the user's own
+    /// name wins when given, and an existing destination (with no saved
+    /// segment map to resume) is sidestepped with " (n)". Anything that
+    /// fails — other than an explicit pause/cancel — returns Fallback so
+    /// the yt-dlp ladder gets its turn.
+    #[allow(clippy::too_many_arguments)]
+    fn run_horse(
+        &self,
+        state: &Arc<Mutex<JobState>>,
+        url: &str,
+        kind: &str,
+        outdir: &PathBuf,
+        filename_req: Option<&str>,
+        connections: i64,
+        speed_limit_kbps: i64,
+    ) -> HorseOutcome {
+        use crate::horse::{self, HorseError, Stop};
+
+        let sniff = crate::engine::sniff_head(url);
+        if !sniff.ok {
+            return HorseOutcome::Fallback;
+        }
+        let mut name = match sniff.filename.filter(|n| !n.is_empty()) {
+            Some(n) => n,
+            None => return HorseOutcome::Fallback,
+        };
+        if let Some(req_name) = filename_req {
+            let safe = crate::engine::sanitize_filename(req_name);
+            if crate::engine::looks_like_final_name(&safe, kind) {
+                name = safe;
+            } else {
+                let ext = crate::engine::ext_of(&name);
+                name = if ext.is_empty() {
+                    safe
+                } else {
+                    format!("{}.{}", safe, ext)
+                };
+            }
+        }
+        let mut dest = outdir.join(&name);
+        if dest.exists() && !dest.with_file_name(format!("{}.horse.json", name)).exists() {
+            let stem = name
+                .rfind('.')
+                .map(|i| name[..i].to_string())
+                .unwrap_or_else(|| name.clone());
+            let ext_with_dot = name
+                .rfind('.')
+                .map(|i| name[i..].to_string())
+                .unwrap_or_default();
+            let mut n = 1;
+            loop {
+                let cand = format!("{} ({}){}", stem, n, ext_with_dot);
+                dest = outdir.join(&cand);
+                if !dest.exists() {
+                    name = cand;
+                    break;
+                }
+                n += 1;
+            }
+        }
+        {
+            let mut st = state.lock().unwrap();
+            st.filename = Some(name.clone());
+        }
+
+        let stop_state = Arc::clone(state);
+        let should_stop = Arc::new(move || -> Option<Stop> {
+            let st = stop_state.lock().unwrap();
+            if st.pause_requested {
+                Some(Stop::Pause)
+            } else if st.cancel {
+                Some(Stop::Cancel)
+            } else {
+                None
+            }
+        });
+        let prog_state = Arc::clone(state);
+        let progress = Arc::new(move |done: u64, total: Option<u64>, speed: f64| {
+            let mut st = prog_state.lock().unwrap();
+            if let Some(t) = total {
+                if t > 0 {
+                    st.percent = (100.0 * done as f64 / t as f64 * 10.0).round() / 10.0;
+                }
+                st.eta = if speed > 0.0 {
+                    Some((t.saturating_sub(done)) as f64 / speed)
+                } else {
+                    None
+                };
+            }
+            st.speed = if speed > 0.0 { Some(speed) } else { None };
+        });
+
+        match horse::download(
+            url,
+            &dest,
+            connections,
+            (speed_limit_kbps.max(0) as u64) * 1024,
+            Some(should_stop),
+            Some(progress),
+        ) {
+            Ok(path) => HorseOutcome::Done(path.to_string_lossy().into_owned()),
+            Err(HorseError::Paused) => HorseOutcome::Paused,
+            Err(HorseError::Fallback(_)) => HorseOutcome::Fallback,
+            Err(HorseError::Failed(msg)) => {
+                if state.lock().unwrap().cancel {
+                    return HorseOutcome::Canceled;
+                }
+                let mut st = state.lock().unwrap();
+                let short: String = msg.chars().take(120).collect();
+                st.note(&format!(
+                    "turbo path unavailable ({}) — engine takes over",
+                    short
+                ));
+                HorseOutcome::Fallback
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn worker(
         &self,
@@ -561,6 +689,63 @@ impl Manager {
         }
         let outdir_path = PathBuf::from(&outdir);
         let _ = std::fs::create_dir_all(&outdir_path);
+
+        // The horse takes direct files: segmented and resumable. Any
+        // failure that isn't an explicit pause/cancel falls through to
+        // the yt-dlp ladder below, exactly like the Python core.
+        if turbo && !playlist && kind == "file" {
+            match self.run_horse(
+                &state,
+                &url,
+                &kind,
+                &outdir_path,
+                filename.as_deref(),
+                connections,
+                speed_limit_kbps,
+            ) {
+                HorseOutcome::Done(final_path) => {
+                    let mut st = state.lock().unwrap();
+                    st.status = "done".into();
+                    st.percent = 100.0;
+                    st.path = Some(final_path.clone());
+                    st.finished = Some(now());
+                    st.error = None;
+                    st.hint = None;
+                    st.note(&format!("saved: {}", final_path));
+                    let name = st
+                        .filename
+                        .clone()
+                        .unwrap_or_else(|| "download".to_string());
+                    drop(st);
+                    self.persist();
+                    notify_done(&self.app, &name);
+                    self.sem.release();
+                    return;
+                }
+                HorseOutcome::Paused => {
+                    let mut st = state.lock().unwrap();
+                    st.pause_requested = false;
+                    st.status = "paused".into();
+                    st.finished = None;
+                    st.error = None;
+                    st.note("paused — resume keeps every byte so far");
+                    drop(st);
+                    self.persist();
+                    self.sem.release();
+                    return;
+                }
+                HorseOutcome::Canceled => {
+                    let mut st = state.lock().unwrap();
+                    st.status = "canceled".into();
+                    st.finished = Some(now());
+                    drop(st);
+                    self.sem.release();
+                    return;
+                }
+                HorseOutcome::Fallback => {}
+            }
+        }
+
         let ladder = Engine::ladder(&url);
         {
             let mut st = state.lock().unwrap();

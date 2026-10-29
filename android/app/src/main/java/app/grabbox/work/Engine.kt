@@ -296,7 +296,7 @@ object Engine {
             .replace(Regex("\\s+"), " ")
     }
 
-    private fun looksLikeFinalName(name: String, kind: String): Boolean {
+    fun looksLikeFinalName(name: String, kind: String): Boolean {
         val ext = name.substringAfterLast('.', "").lowercase()
         if (ext.isBlank()) return false
         val audio = setOf("mp3", "m4a", "aac", "opus", "ogg", "oga", "flac", "wav", "wma", "aiff")
