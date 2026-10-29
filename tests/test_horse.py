@@ -29,6 +29,13 @@ class _Handler(BaseHTTPRequestHandler):
     per_conn_bps = 0          # 0 = unthrottled
     support_ranges = True
     range_log = []            # every Range header seen, in order
+    range_count = 0           # non-probe Range GETs, for the special paths
+    count_lock = threading.Lock()
+
+    # /slowfirst.bin: the FIRST connection is throttled hard, the rest fly.
+    # /flaky429.bin: the first two segment requests get HTTP 429.
+    SLOW_BPS = 60 * 1024
+    FAST_BPS = 900 * 1024
 
     def log_message(self, *a):
         pass
@@ -39,6 +46,17 @@ class _Handler(BaseHTTPRequestHandler):
         rng = self.headers.get("Range")
         if rng:
             type(self).range_log.append(rng)
+        if rng and rng != "bytes=0-0":   # bytes=0-0 is the engine's probe
+            with type(self).count_lock:
+                type(self).range_count += 1
+                n = type(self).range_count
+            if self.path == "/flaky429.bin" and n <= 2:
+                self.send_response(429)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if self.path == "/slowfirst.bin":
+                rate = type(self).SLOW_BPS if n == 1 else type(self).FAST_BPS
         start, end, status = 0, len(data) - 1, 200
         if rng and type(self).support_ranges:
             m = re.match(r"bytes=(\d+)-(\d*)", rng)
@@ -77,6 +95,7 @@ class HorseTest(unittest.TestCase):
         _Handler.per_conn_bps = 0
         _Handler.support_ranges = True
         _Handler.range_log = []
+        _Handler.range_count = 0
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.url = "http://127.0.0.1:%d/file.bin" % self.server.server_port
@@ -146,6 +165,33 @@ class HorseTest(unittest.TestCase):
         horse.download(self.url, self.dest, connections=4,
                        should_stop=lambda: None)
         self.assertEqual(self.read_dest(), _Handler.payload_bytes)
+
+    def test_work_stealing_beats_the_slow_first_connection(self):
+        # THE DownloadCraft scenario: connection #1 is throttled to
+        # 60 KB/s, the rest run at 900 KB/s. Fixed split would park a
+        # quarter of the file (1.5 MB) on the slow connection: ~25s.
+        # Work-stealing splits its segment away; the whole file must
+        # land far sooner, byte-exact.
+        _Handler.payload_bytes = payload(6 * 1024 * 1024, seed=11)
+        url = "http://127.0.0.1:%d/slowfirst.bin" % self.server.server_port
+        dest = os.path.join(self.dir, "slowfirst.bin")
+        t0 = time.monotonic()
+        horse.download(url, dest, connections=4)
+        elapsed = time.monotonic() - t0
+        with open(dest, "rb") as fh:
+            self.assertEqual(fh.read(), _Handler.payload_bytes)
+        fixed_split_floor = (len(_Handler.payload_bytes) / 4.0) \
+            / _Handler.SLOW_BPS
+        print("\n[horse steal] slow-first: %.2fs (fixed split >= %.0fs)"
+              % (elapsed, fixed_split_floor))
+        self.assertLess(elapsed, fixed_split_floor / 2.0)
+
+    def test_429_is_retried_not_fatal(self):
+        url = "http://127.0.0.1:%d/flaky429.bin" % self.server.server_port
+        dest = os.path.join(self.dir, "flaky.bin")
+        horse.download(url, dest, connections=4)
+        with open(dest, "rb") as fh:
+            self.assertEqual(fh.read(), _Handler.payload_bytes)
 
     def test_no_range_server_falls_back_to_single_stream(self):
         _Handler.support_ranges = False
