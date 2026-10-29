@@ -711,7 +711,7 @@ pub fn version_age_days(version: &str) -> Option<i64> {
     Some(now - then)
 }
 
-fn sanitize_filename(name: &str) -> String {
+pub(crate) fn sanitize_filename(name: &str) -> String {
     let bad = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
     name.chars()
         .map(|c| if bad.contains(&c) { ' ' } else { c })
@@ -723,7 +723,7 @@ fn sanitize_filename(name: &str) -> String {
 
 /// True when the sanitized name already ends in a plausible extension for the
 /// chosen kind so we don't append another one ("song.mp3.mp3").
-fn looks_like_final_name(name: &str, kind: &str) -> bool {
+pub(crate) fn looks_like_final_name(name: &str, kind: &str) -> bool {
     let ext = match name.rfind('.') {
         Some(i) if i > 0 && i + 1 < name.len() => name[i + 1..].to_ascii_lowercase(),
         _ => return false,
@@ -769,7 +769,7 @@ impl SniffResult {
     }
 }
 
-fn sniff_head(url: &str) -> SniffResult {
+pub(crate) fn sniff_head(url: &str) -> SniffResult {
     let mut out = SniffResult {
         ok: false,
         kind: "other".into(),
@@ -802,7 +802,7 @@ fn sniff_head(url: &str) -> SniffResult {
     out
 }
 
-fn ext_of(name: &str) -> String {
+pub(crate) fn ext_of(name: &str) -> String {
     let name = name.split('?').next().unwrap_or("").split('#').next().unwrap_or("");
     match name.rfind('.') {
         Some(i) if i > 0 => name[i + 1..].to_lowercase(),

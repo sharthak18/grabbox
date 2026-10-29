@@ -9,6 +9,7 @@
 mod config;
 mod engine;
 mod fsys;
+mod horse;
 mod jobs;
 
 use config::Config;

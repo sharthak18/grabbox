@@ -12,8 +12,8 @@ on **IDM** (desktop download managers) and **VidMate/Snaptube** (mobile):
 
 | Trick | Where | How |
 |---|---|---|
-| Multi-connection segments | Direct files (Python core) | `grabbox/horse.py`: up to **16 connections** pull byte ranges into a pre-sized `.part`. A server that throttles *per connection* suddenly serves N× faster. Servers that lie about Range support degrade quietly to one stream. |
-| Work-stealing splits | Direct files (Python core) | Segmentation is **dynamic**, not fixed (design credit: DownloadCraft's MIT engine — see `NOTICE.md`): one segment to start; a free connection takes orphaned work or **splits the segment that would finish last**, proportionally to measured speeds. A connection that turns out slow keeps a small share instead of parking a fixed quarter of the file. 429/503 answers back off and retry instead of failing the download. |
+| Multi-connection segments | Direct files (all three stacks) | Up to **16 connections** pull byte ranges into a pre-sized `.part` — `grabbox/horse.py`, `desktop/src-tauri/src/horse.rs`, `android/.../work/Horse.kt`, same algorithm. A server that throttles *per connection* suddenly serves N× faster. Servers that lie about Range support degrade quietly to one stream. When the native path declines (web page, HTTP error), yt-dlp takes over as before. |
+| Work-stealing splits | Direct files (all three stacks) | Segmentation is **dynamic**, not fixed (design credit: DownloadCraft's MIT engine — see `NOTICE.md`): one segment to start; a free connection takes orphaned work or **splits the segment that would finish last**, proportionally to measured speeds. A connection that turns out slow keeps a small share instead of parking a fixed quarter of the file. 429/503 answers back off and retry instead of failing the download. |
 | Concurrent fragments | Everything yt-dlp serves (all stacks) | `--concurrent-fragments N` + `--http-chunk-size 10M` + 1 MB buffers — HLS/DASH (YouTube & friends) downloads its pieces in parallel instead of one by one. |
 | Patient retries | yt-dlp path | 10 retries with **exponential backoff** sleeps instead of hammering a throttling server into a longer ban. |
 
@@ -77,5 +77,7 @@ python3 -m grabbox                          # the real thing
 
 The Rust and Kotlin ports implement the same spec (same config keys,
 same yt-dlp flags, same jobs.json shape — the Python and desktop files
-are even interchangeable). CI compiles those two; the Python core is the
-reference implementation and carries the tests.
+are even interchangeable — and now the same native horse: same segment
+map on disk, same claim/split algorithm, so a `.part` paused by one
+stack can be resumed by another). CI compiles those two; the Python
+core is the reference implementation and carries the tests.

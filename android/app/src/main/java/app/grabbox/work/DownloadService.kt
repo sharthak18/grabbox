@@ -151,6 +151,13 @@ class DownloadService : Service() {
         slotHolders.add(jobId)
         JobStore.update(jobId) { it.copy(status = "running", attempts = ladder.size) }
 
+        // The horse takes direct files: segmented and resumable. Any
+        // failure that isn't an explicit pause/cancel falls through to
+        // the yt-dlp ladder below, exactly like the Python core.
+        if (Engine.turbo && !job.playlist && job.kind == "file") {
+            if (runHorse(jobId, job, outDir)) return finish(jobId)
+        }
+
         var lastError = ""
         var lastHint = ""
         ladder.forEachIndexed { index, (_, rungArgs) ->
@@ -216,6 +223,98 @@ class DownloadService : Service() {
         JobStore.update(jobId) { it.copy(status = "error", error = lastError, hint = lastHint.ifBlank { null }) }
         notifyFailed(jobId, lastError)
         finish(jobId)
+    }
+
+    /**
+     * One native horse attempt for a direct file. Mirrors the Python
+     * core's `_run_horse`: the probed filename decides the destination,
+     * the user's own name wins when given, and an existing destination
+     * (with no saved segment map to resume) is sidestepped with " (n)".
+     * Returns true when the job is fully handled (done / paused /
+     * canceled); false means the yt-dlp ladder gets its turn.
+     */
+    private fun runHorse(jobId: String, job: JobStore.Job, outDir: File): Boolean {
+        var name = job.filename?.ifBlank { null } ?: job.title.ifBlank { "download" }
+        job.customName?.takeIf { it.isNotBlank() }?.let { custom ->
+            val safe = Engine.sanitizeFilename(custom)
+            name = if (Engine.looksLikeFinalName(safe, job.kind)) {
+                safe
+            } else {
+                val dot = name.lastIndexOf('.')
+                safe + if (dot > 0) name.substring(dot) else ""
+            }
+        }
+        var dest = File(outDir, name)
+        if (dest.exists() && !File(dest.path + ".horse.json").exists()) {
+            val dot = name.lastIndexOf('.')
+            val stem = if (dot > 0) name.substring(0, dot) else name
+            val ext = if (dot > 0) name.substring(dot) else ""
+            var n = 1
+            while (true) {
+                val cand = "$stem ($n)$ext"
+                val candFile = File(outDir, cand)
+                if (!candFile.exists()) {
+                    name = cand
+                    dest = candFile
+                    break
+                }
+                n++
+            }
+        }
+        JobStore.update(jobId) { it.copy(filename = name) }
+
+        var lastNotify = 0L
+        return try {
+            val file = Horse.download(
+                url = job.url,
+                dest = dest,
+                connections = Engine.connections,
+                rateLimitBps = Engine.speedLimitKbps * 1024L,
+                shouldStop = {
+                    when {
+                        jobId in paused -> "pause"
+                        jobId in canceled -> "cancel"
+                        else -> null
+                    }
+                },
+                progress = { done, total, speed ->
+                    val pct = if (total != null && total > 0) {
+                        (done * 100f / total).coerceIn(0f, 100f)
+                    } else {
+                        -1f
+                    }
+                    val eta = if (total != null && speed > 0) {
+                        ((total - done) / speed).toLong()
+                    } else {
+                        0L
+                    }
+                    JobStore.update(jobId) { it.copy(percent = pct, etaSec = eta) }
+                    val nowMs = System.currentTimeMillis()
+                    if (nowMs - lastNotify > 1200) {
+                        lastNotify = nowMs
+                        notifyProgress(jobId)
+                    }
+                },
+            )
+            JobStore.update(jobId) {
+                it.copy(
+                    status = "done", percent = 100f, filePath = file.absolutePath,
+                    filename = file.name, error = null, hint = null,
+                )
+            }
+            notifyDone(jobId)
+            true
+        } catch (e: Horse.HorsePaused) {
+            JobStore.update(jobId) { it.copy(status = "paused", error = null, hint = null) }
+            true
+        } catch (e: Horse.HorseError) {
+            if (jobId in canceled) {
+                JobStore.update(jobId) { it.copy(status = "canceled") }
+                true
+            } else {
+                false // engine (yt-dlp) takes over
+            }
+        }
     }
 
     private fun finish(jobId: String) {
