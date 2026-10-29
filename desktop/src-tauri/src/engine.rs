@@ -3,6 +3,7 @@
 
 use serde_json::{json, Map, Value};
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -243,6 +244,11 @@ impl Engine {
             res["kind"] = json!(direct.kind);
             res["direct"] = direct.to_json();
             res["title"] = json!(direct.filename.clone().unwrap_or_else(|| url.to_string()));
+            if direct.kind == "archive" {
+                // Peek inside before downloading (best-effort).
+                res["archive_entries"] =
+                    zip_list_remote(url).unwrap_or_else(|| json!([]));
+            }
             return Ok(res);
         }
 
@@ -746,6 +752,99 @@ pub(crate) fn looks_like_final_name(name: &str, kind: &str) -> bool {
 }
 
 // ----------------------------------------------------------- HEAD sniff --
+
+// ----------------------------------------------------- remote ZIP peek --
+
+/// GET exactly [start, end]; None unless the server honoured the range.
+fn zip_fetch_range(agent: &ureq::Agent, url: &str, start: u64, end: u64) -> Option<Vec<u8>> {
+    let range = format!("bytes={}-{}", start, end);
+    let resp = agent.get(url).set("Range", &range).call().ok()?;
+    if resp.status() != 206 {
+        return None;
+    }
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(end - start + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    Some(buf)
+}
+
+/// List a remote ZIP's contents in 1-2 range requests (its central
+/// directory lives at the end of the file). Same algorithm as the
+/// Python core's `grabbox/zipeek.py`. Best-effort: ZIP64, multi-disk
+/// and range-less servers return None and the probe just stays plain.
+fn zip_list_remote(url: &str) -> Option<Value> {
+    let size = sniff_head(url).size?;
+    if size < 22 {
+        return None;
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(15))
+        .timeout_read(std::time::Duration::from_secs(15))
+        .user_agent(USER_AGENT)
+        .build();
+    let tail_len = size.min(22 + 65535);
+    let tail = zip_fetch_range(&agent, url, size - tail_len, size - 1)?;
+    if tail.len() < 22 {
+        return None;
+    }
+    // The End-Of-Central-Directory record is the last structure in the
+    // file (plus an optional comment): search backwards for its mark.
+    let mut eocd = None;
+    let mut i = tail.len() - 4;
+    loop {
+        if &tail[i..i + 4] == b"PK\x05\x06" {
+            eocd = Some(i);
+            break;
+        }
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+    }
+    let eocd = eocd?;
+    if eocd + 22 > tail.len() {
+        return None;
+    }
+    let u16le = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    let u32le = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    if u16le(&tail, eocd + 4) != 0 {
+        return None; // multi-disk
+    }
+    let cd_size = u32le(&tail, eocd + 12) as u64;
+    let cd_offset = u32le(&tail, eocd + 16) as u64;
+    if cd_size == 0xFFFF_FFFF || cd_offset == 0xFFFF_FFFF {
+        return None; // ZIP64 keeps its real numbers elsewhere
+    }
+    let tail_base = size - tail_len;
+    let cd: Vec<u8> = if cd_offset >= tail_base && cd_offset + cd_size <= size {
+        tail[(cd_offset - tail_base) as usize..(cd_offset - tail_base + cd_size) as usize].to_vec()
+    } else {
+        zip_fetch_range(&agent, url, cd_offset, cd_offset + cd_size - 1)?
+    };
+    let mut entries = Vec::new();
+    let mut off = 0usize;
+    while off + 46 <= cd.len() && entries.len() < 500 {
+        if &cd[off..off + 4] != b"PK\x01\x02" {
+            break;
+        }
+        let csize = u32le(&cd, off + 20) as u64;
+        let usize_ = u32le(&cd, off + 24) as u64;
+        let nlen = u16le(&cd, off + 28) as usize;
+        let xlen = u16le(&cd, off + 30) as usize;
+        let clen = u16le(&cd, off + 32) as usize;
+        let name_end = (off + 46 + nlen).min(cd.len());
+        let name = String::from_utf8_lossy(&cd[off + 46..name_end]).into_owned();
+        entries.push(json!({ "name": name, "size": usize_, "compressed": csize }));
+        off += 46 + nlen + xlen + clen;
+    }
+    if entries.is_empty() {
+        None
+    } else {
+        Some(json!(entries))
+    }
+}
 
 pub struct SniffResult {
     pub ok: bool,

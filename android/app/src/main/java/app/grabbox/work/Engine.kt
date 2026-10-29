@@ -6,6 +6,7 @@ import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import kotlin.math.min
 
 /**
  * Everything the app knows about talking to yt-dlp — the same semantics as the
@@ -31,6 +32,7 @@ object Engine {
         val hasAudio: Boolean = false,
         val directSize: Long? = null,
         val directFilename: String? = null,
+        val archiveEntries: List<ZipEntry> = emptyList(),
         val note: String? = null,
         val error: String? = null,
         val hint: String? = null,
@@ -62,11 +64,19 @@ object Engine {
 
     // ------------------------------------------------------------ probing --
 
+    /** One row of a remote ZIP listing. */
+    data class ZipEntry(val name: String, val size: Long)
+
     fun probe(url: String): ProbeInfo {
         // 1. Plain file links (images, installers, archives) don't need yt-dlp.
         sniff(url)?.let { direct ->
             if (direct.kind in listOf("video", "audio", "image", "app", "archive")) {
-                return direct
+                // Peek inside archives before downloading (best-effort).
+                return if (direct.kind == "archive") {
+                    direct.copy(archiveEntries = zipList(url) ?: emptyList())
+                } else {
+                    direct
+                }
             }
         }
 
@@ -328,6 +338,105 @@ object Engine {
         )
         dir.mkdirs()
         return dir
+    }
+
+    // --------------------------------------------------------- ZIP peek --
+
+    private const val ZIP_UA =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+    /** GET exactly [start, end]; null unless the server honoured it. */
+    private fun zipFetchRange(url: String, start: Long, end: Long): ByteArray? {
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15_000
+            readTimeout = 15_000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", ZIP_UA)
+            setRequestProperty("Range", "bytes=$start-$end")
+        }
+        return try {
+            if (conn.responseCode != 206) return null
+            val want = (end - start + 1).toInt()
+            val out = java.io.ByteArrayOutputStream()
+            val buf = ByteArray(64 * 1024)
+            var remaining = want
+            val stream = conn.inputStream
+            while (remaining > 0) {
+                val n = stream.read(buf, 0, min(buf.size, remaining))
+                if (n < 0) break
+                out.write(buf, 0, n)
+                remaining -= n
+            }
+            out.toByteArray().takeIf { it.size == want }
+        } catch (e: Exception) {
+            null
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    /**
+     * List a remote ZIP's contents in 1-2 range requests (its central
+     * directory lives at the end of the file). Same algorithm as the
+     * Python core's `grabbox/zipeek.py`. Best-effort: ZIP64, multi-disk
+     * and range-less servers return null and the probe just stays plain.
+     */
+    fun zipList(url: String): List<ZipEntry>? {
+        val size = sniff(url)?.directSize ?: return null
+        if (size < 22) return null
+        val tailLen = min(size, (22 + 65535).toLong())
+        val tail = zipFetchRange(url, size - tailLen, size - 1) ?: return null
+
+        fun u16(b: ByteArray, o: Int) =
+            (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8)
+        fun u32(b: ByteArray, o: Int) =
+            u16(b, o).toLong() or (u16(b, o + 2).toLong() shl 16)
+        fun sig(b: ByteArray, o: Int, third: Int, fourth: Int) =
+            b[o] == 0x50.toByte() && b[o + 1] == 0x4B.toByte() &&
+                b[o + 2] == third.toByte() && b[o + 3] == fourth.toByte()
+
+        // The End-Of-Central-Directory record is the last structure in
+        // the file (plus an optional comment): search backwards.
+        var eocd = -1
+        var i = tail.size - 4
+        while (i >= 0) {
+            if (sig(tail, i, 0x05, 0x06)) {
+                eocd = i
+                break
+            }
+            i--
+        }
+        if (eocd < 0 || eocd + 22 > tail.size) return null
+        if (u16(tail, eocd + 4) != 0) return null // multi-disk
+        val cdSize = u32(tail, eocd + 12)
+        val cdOffset = u32(tail, eocd + 16)
+        if (cdSize == 0xFFFF_FFFFL || cdOffset == 0xFFFF_FFFFL) return null // ZIP64
+
+        val tailBase = size - tailLen
+        val cd: ByteArray = if (cdOffset >= tailBase && cdOffset + cdSize <= size) {
+            tail.copyOfRange(
+                (cdOffset - tailBase).toInt(),
+                (cdOffset - tailBase + cdSize).toInt(),
+            )
+        } else {
+            zipFetchRange(url, cdOffset, cdOffset + cdSize - 1) ?: return null
+        }
+
+        val entries = mutableListOf<ZipEntry>()
+        var off = 0
+        while (off + 46 <= cd.size && entries.size < 500) {
+            if (!sig(cd, off, 0x01, 0x02)) break
+            val usize_ = u32(cd, off + 24)
+            val nlen = u16(cd, off + 28)
+            val xlen = u16(cd, off + 30)
+            val clen = u16(cd, off + 32)
+            val nameEnd = min(off + 46 + nlen, cd.size)
+            val name = String(cd, off + 46, nameEnd - (off + 46), Charsets.UTF_8)
+            entries.add(ZipEntry(name, usize_))
+            off += 46 + nlen + xlen + clen
+        }
+        return entries.ifEmpty { null }
     }
 
     // ------------------------------------------------------- HEAD sniff --

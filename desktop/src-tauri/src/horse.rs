@@ -13,6 +13,13 @@
 //! file, guarded by size + ETag/Last-Modified, so pause / crash / reboot
 //! resumes mid-segment. Servers that lie about Range support degrade
 //! quietly to a single stream that still resumes by appending.
+//!
+//! Same defences as the Python reference: responses are validated (an
+//! HTML error page is never saved under a media name; a 206 whose
+//! Content-Range disagrees with the request is rejected), expired
+//! signed links (403/410) are re-resolved from the original URL with
+//! bytes kept, and the engine heals itself — stalled connections are
+//! reopened and 429/503 answers halve the connection count.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -29,6 +36,10 @@ const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
 const CHUNK: u64 = 256 * 1024; // per-connection read/write block
 const MIN_SEGMENT: u64 = 512 * 1024; // don't slice thinner than this
 const SPLIT_MIN: u64 = 256 * 1024; // smallest slice worth stealing
+/// A connection that delivers no new bytes for this long is reopened.
+const STALL: Duration = Duration::from_secs(20);
+/// How many times an expired (403/410) link may be re-resolved.
+const MAX_REFRESHES: u32 = 2;
 const STATE_SUFFIX: &str = ".horse.json";
 const PART_SUFFIX: &str = ".part";
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -61,6 +72,10 @@ enum HErr {
     RangeIgnored,
     /// 429/503: back off and retry the segment — never a hard failure.
     Throttled,
+    /// 403/410 mid-download: the (usually signed) URL went stale.
+    /// download() re-resolves the source URL and continues the same
+    /// segment map under the fresh URL — bytes are kept.
+    LinkExpired,
 }
 
 type StopFn = dyn Fn() -> Option<Stop> + Send + Sync;
@@ -269,6 +284,41 @@ struct ProbeInfo {
     etag: Option<String>,
     last_modified: Option<String>,
     status: u16,
+    final_url: String,
+}
+
+/// True when the body's first bytes are plainly an HTML page.
+fn looks_like_html(first: &[u8]) -> bool {
+    let mut i = 0;
+    if first.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        i = 3; // UTF-8 BOM
+    }
+    while i < first.len() && matches!(first[i], b' ' | b'\t' | b'\r' | b'\n') {
+        i += 1;
+    }
+    let head: Vec<u8> = first[i.min(first.len())..]
+        .iter()
+        .take(9)
+        .map(|b| b.to_ascii_lowercase())
+        .collect();
+    [&b"<!doctype"[..], b"<html", b"<head", b"<body"]
+        .iter()
+        .any(|p| head.starts_with(p))
+}
+
+/// 'bytes 100-199/1234' -> (100, 199, Some(1234)); total may be '*'.
+fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let (unit, rest) = value.trim().split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (span, total) = rest.split_once('/')?;
+    let (start_s, end_s) = span.split_once('-')?;
+    Some((
+        start_s.trim().parse().ok()?,
+        end_s.trim().parse().ok()?,
+        total.trim().parse().ok(),
+    ))
 }
 
 fn probe_ranges(agent: &Agent, url: &str) -> Result<ProbeInfo, HErr> {
@@ -283,11 +333,13 @@ fn probe_ranges(agent: &Agent, url: &str) -> Result<ProbeInfo, HErr> {
                 etag: None,
                 last_modified: None,
                 status: code,
+                final_url: url.to_string(),
             })
         }
         Err(e) => return Err(HErr::Failed(e.to_string())),
     };
     let status = resp.status();
+    let final_url = resp.get_url().to_string();
     let crange = resp.header("Content-Range").map(|s| s.to_string());
     let length = resp.header("Content-Length").map(|s| s.to_string());
     let accept = resp.header("Accept-Ranges").map(|s| s.to_string());
@@ -297,10 +349,12 @@ fn probe_ranges(agent: &Agent, url: &str) -> Result<ProbeInfo, HErr> {
         .unwrap_or_default();
     let etag = resp.header("ETag").map(|s| s.to_string());
     let last_modified = resp.header("Last-Modified").map(|s| s.to_string());
-    // Drain a byte so the connection can be reused, then drop it.
+    // Keep the first bytes: enough to sniff an HTML error page out from
+    // behind a lying Content-Type before a single byte is saved.
     let mut reader = resp.into_reader();
     let mut buf = [0u8; 1024];
-    let _ = reader.read(&mut buf);
+    let got = reader.read(&mut buf).unwrap_or(0);
+    let first_bytes = &buf[..got];
 
     let mut size = None;
     if let Some(cr) = &crange {
@@ -323,12 +377,21 @@ fn probe_ranges(agent: &Agent, url: &str) -> Result<ProbeInfo, HErr> {
             "server returned a web page, not a file".into(),
         ));
     }
+    if status == 200 && looks_like_html(first_bytes) {
+        // Magic-byte check, DownloadCraft's rule: an error page with a
+        // lying Content-Type (or a Content-Length) is still an error
+        // page. Never save it under a media/file name.
+        return Err(HErr::Fallback(
+            "server returned a web page, not a file".into(),
+        ));
+    }
     Ok(ProbeInfo {
         size,
         ranges,
         etag,
         last_modified,
         status,
+        final_url,
     })
 }
 
@@ -357,6 +420,9 @@ pub fn download(
         Err(HErr::Failed(m)) => Err(HorseError::Failed(m)),
         Err(HErr::RangeIgnored) => Err(HorseError::Failed("server ignored Range".into())),
         Err(HErr::Throttled) => Err(HorseError::Failed("throttled".into())),
+        Err(HErr::LinkExpired) => {
+            Err(HorseError::Failed("link expired (HTTP 403)".into()))
+        }
     }
 }
 
@@ -373,12 +439,20 @@ fn download_inner(
     if info.status >= 400 {
         return Err(HErr::Failed(format!("HTTP {}", info.status)));
     }
+    // Segments fetch the URL the probe landed on (redirects resolved
+    // once, not per request). `url` stays the source: re-resolving it is
+    // how an expired signed link gets refreshed below.
+    let mut current = if info.final_url.is_empty() {
+        url.to_string()
+    } else {
+        info.final_url.clone()
+    };
     let work = suffix_path(dest, PART_SUFFIX);
     let state_path = suffix_path(dest, STATE_SUFFIX);
     let mut saved = state_load(&state_path);
     let resume = saved
         .as_ref()
-        .map(|s| valid_resume(s, url, &info) && work.exists())
+        .map(|s| valid_resume(s, &current, &info) && work.exists())
         .unwrap_or(false);
     if !resume {
         state_drop(&state_path);
@@ -388,21 +462,90 @@ fn download_inner(
 
     if let Some(size) = info.size {
         if info.ranges && connections > 1 && size >= MIN_SEGMENT * 2 {
-            match download_segmented(
-                agent, url, dest, &work, &state_path, saved.clone(), &info, size,
-                connections as usize, rate_limit_bps, should_stop, progress,
-            ) {
-                Ok(p) => return Ok(p),
-                Err(HErr::RangeIgnored) => {
-                    saved = None; // ranged claims were a lie; start clean
+            let mut refreshes = 0;
+            loop {
+                match download_segmented(
+                    agent, &current, dest, &work, &state_path, saved.clone(), &info, size,
+                    connections as usize, rate_limit_bps, should_stop, progress,
+                ) {
+                    Ok(p) => return Ok(p),
+                    Err(HErr::RangeIgnored) => {
+                        saved = None; // ranged claims were a lie; start clean
+                        break;
+                    }
+                    Err(HErr::LinkExpired) => {
+                        refreshes += 1;
+                        if refreshes > MAX_REFRESHES {
+                            return Err(HErr::Failed(
+                                "link expired and could not be refreshed".into(),
+                            ));
+                        }
+                        let (new_url, new_saved) =
+                            refresh(agent, url, &current, &info, &state_path)?;
+                        current = new_url;
+                        saved = new_saved;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
         }
     }
     download_single(
-        agent, url, dest, &work, &state_path, saved, &info, rate_limit_bps, should_stop, progress,
+        agent, &current, dest, &work, &state_path, saved, &info, rate_limit_bps, should_stop,
+        progress,
     )
+}
+
+/// Re-resolve the source URL after a 403/410. Returns the fresh URL and
+/// the segment map re-pointed at it — but only when the fresh probe
+/// describes the *same file* (same size, non-conflicting validators),
+/// so bytes already on disk stay valid.
+fn refresh(
+    agent: &Agent,
+    source_url: &str,
+    old_url: &str,
+    orig_info: &ProbeInfo,
+    state_path: &Path,
+) -> Result<(String, Option<StateJson>), HErr> {
+    let fresh = probe_ranges(agent, source_url)?;
+    if fresh.status >= 400 {
+        return Err(HErr::Failed(format!(
+            "link expired (HTTP {})",
+            fresh.status
+        )));
+    }
+    let new_url = if fresh.final_url.is_empty() {
+        source_url.to_string()
+    } else {
+        fresh.final_url.clone()
+    };
+    if new_url == old_url {
+        return Err(HErr::Failed(
+            "link expired (HTTP 403) and re-resolving the source gave the same URL".into(),
+        ));
+    }
+    if fresh.size != orig_info.size {
+        return Err(HErr::Failed(
+            "refreshed link points at a different file".into(),
+        ));
+    }
+    for (fresh_v, orig_v) in [
+        (&fresh.etag, &orig_info.etag),
+        (&fresh.last_modified, &orig_info.last_modified),
+    ] {
+        if let (Some(a), Some(b)) = (orig_v, fresh_v) {
+            if a != b {
+                return Err(HErr::Failed(
+                    "refreshed link points at a different file".into(),
+                ));
+            }
+        }
+    }
+    let mut saved = state_load(state_path);
+    if let Some(s) = saved.as_mut() {
+        s.url = new_url.clone();
+    }
+    Ok((new_url, saved))
 }
 
 fn state_dict(url: &str, info: &ProbeInfo, segments: Vec<SegRow>) -> StateJson {
@@ -447,6 +590,17 @@ struct Inner {
     speeds: HashMap<usize, f64>, // worker -> EMA bytes/sec
     speed_bytes: HashMap<usize, (u64, Instant)>,
     failure: Option<HErr>,
+    // Self-healing: how many connections may fly at once (a 429/503
+    // halves it) and how many claims are in flight right now.
+    cap: usize,
+    active: usize,
+}
+
+/// claim() outcome: got a segment / park briefly (work remains but the
+/// connection cap is full) / nothing left to do.
+enum Claim {
+    Seg(usize),
+    Wait,
 }
 
 impl Shared {
@@ -478,8 +632,12 @@ impl Shared {
     }
 
     /// Take orphaned work, or split the segment finishing last.
-    fn claim(&self, worker: usize) -> Option<usize> {
+    fn claim(&self, worker: usize) -> Option<Claim> {
         let mut g = self.inner.lock().unwrap();
+        let unfinished = g.segments.iter().any(|s| s.end > s.pos);
+        if unfinished && g.active >= g.cap {
+            return Some(Claim::Wait); // cap full — park, stay ready
+        }
         // 1. Orphaned segments first: biggest one wins.
         let mut best: Option<usize> = None;
         for (i, s) in g.segments.iter().enumerate() {
@@ -499,7 +657,8 @@ impl Shared {
         }
         if let Some(i) = best {
             g.segments[i].owner = Some(worker);
-            return Some(i);
+            g.active += 1;
+            return Some(Claim::Seg(i));
         }
         // 2. Split the segment with the longest expected finish time.
         let mut pick: Option<usize> = None;
@@ -516,7 +675,9 @@ impl Shared {
                 }
             }
         }
-        let i = pick?;
+        let Some(i) = pick else {
+            return if unfinished { Some(Claim::Wait) } else { None };
+        };
         let (pos, end, owner) = {
             let s = &g.segments[i];
             (s.pos, s.end, s.owner.unwrap_or(usize::MAX))
@@ -551,7 +712,15 @@ impl Shared {
             owner: Some(worker),
             fails: 0,
         });
-        Some(idx)
+        g.active += 1;
+        Some(Claim::Seg(idx))
+    }
+
+    /// Hand a segment back and free its connection slot.
+    fn release(&self, idx: usize) {
+        let mut g = self.inner.lock().unwrap();
+        g.segments[idx].owner = None;
+        g.active = g.active.saturating_sub(1);
     }
 
     fn note_speed(g: &mut Inner, worker: usize, n: u64) {
@@ -587,14 +756,39 @@ fn run_claim(sh: &Shared, agent: &Agent, worker: usize, idx: usize, work: &Path)
         Err(ureq::Error::Status(429, _)) | Err(ureq::Error::Status(503, _)) => {
             return Err(HErr::Throttled)
         }
+        Err(ureq::Error::Status(403, _)) | Err(ureq::Error::Status(410, _)) => {
+            return Err(HErr::LinkExpired)
+        }
         Err(ureq::Error::Status(416, _)) => {
             return Err(HErr::Failed("range not satisfiable (HTTP 416)".into()))
         }
         Err(ureq::Error::Status(code, _)) => return Err(HErr::Failed(format!("HTTP {}", code))),
         Err(e) => return Err(HErr::Failed(e.to_string())),
     };
+    if resp.status() == 403 || resp.status() == 410 {
+        return Err(HErr::LinkExpired);
+    }
     if resp.status() != 206 {
         return Err(HErr::RangeIgnored);
+    }
+    // Validation: the bytes must start where we asked, and belong to the
+    // file we probed — never write a misaligned or foreign body at a
+    // good file's offsets.
+    if let Some((cstart, _cend, ctotal)) = resp
+        .header("Content-Range")
+        .and_then(parse_content_range)
+    {
+        if cstart != frm {
+            return Err(HErr::Failed(format!(
+                "server sent the wrong range (asked {}, got {})",
+                frm, cstart
+            )));
+        }
+        if let (Some(total), Some(sz)) = (ctotal, sh.info.size) {
+            if total != sz {
+                return Err(HErr::Failed("file changed mid-download".into()));
+            }
+        }
     }
     let mut reader = resp.into_reader();
     let mut fh = OpenOptions::new()
@@ -602,6 +796,7 @@ fn run_claim(sh: &Shared, agent: &Agent, worker: usize, idx: usize, work: &Path)
         .write(true)
         .open(work)
         .map_err(|e| HErr::Failed(e.to_string()))?;
+    let mut last_advance = Instant::now();
     loop {
         check_stop(&sh.stop)?;
         let (pos, end) = {
@@ -618,6 +813,12 @@ fn run_claim(sh: &Shared, agent: &Agent, worker: usize, idx: usize, work: &Path)
         if n == 0 {
             return Err(HErr::Failed("connection dropped mid-segment".into()));
         }
+        if last_advance.elapsed() > STALL {
+            // Self-healing: bytes stopped arriving on an open connection.
+            // Reopen it (a segment retry) instead of letting it hold the
+            // whole download hostage.
+            return Err(HErr::Failed("connection stalled — reopening".into()));
+        }
         block.truncate(n);
         // Our bound may have shrunk (a split) mid-read: only the bytes up
         // to the current end are ours to write and count.
@@ -631,6 +832,7 @@ fn run_claim(sh: &Shared, agent: &Agent, worker: usize, idx: usize, work: &Path)
             allowed
         };
         if allowed > 0 {
+            last_advance = Instant::now();
             sh.limiter.take(allowed);
             fh.seek(SeekFrom::Start(pos)).map_err(|e| HErr::Failed(e.to_string()))?;
             fh.write_all(&block[..allowed as usize])
@@ -704,6 +906,8 @@ fn download_segmented(
             speeds: HashMap::new(),
             speed_bytes: HashMap::new(),
             failure: None,
+            cap: connections.max(1),
+            active: 0,
         }),
         prog: Progress::new(Some(size), done0, progress.clone()),
         limiter: RateLimiter::new(rate_limit_bps),
@@ -743,24 +947,38 @@ fn download_segmented(
 
 fn worker_loop(sh: &Shared, agent: &Agent, wid: usize, work: &Path, stop: &Option<Arc<StopFn>>) {
     loop {
-        let Some(idx) = sh.claim(wid) else { return };
-        match run_claim(sh, agent, wid, idx, work) {
-            Ok(()) => {
-                let mut g = sh.inner.lock().unwrap();
-                g.segments[idx].owner = None;
+        {
+            let g = sh.inner.lock().unwrap();
+            if g.failure.is_some() {
+                return; // a sibling already decided this download
             }
+        }
+        let idx = match sh.claim(wid) {
+            None => return,
+            Some(Claim::Wait) => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Some(Claim::Seg(idx)) => idx,
+        };
+        match run_claim(sh, agent, wid, idx, work) {
+            Ok(()) => sh.release(idx),
             Err(HErr::Throttled) => {
+                sh.release(idx);
                 {
+                    // 429/503: the server asked for fewer of us.
                     let mut g = sh.inner.lock().unwrap();
-                    g.segments[idx].owner = None;
+                    g.cap = (g.cap / 2).max(1);
                 }
                 std::thread::sleep(Duration::from_secs(2)); // ease off, keep the bytes
             }
-            Err(e @ (HErr::Paused | HErr::RangeIgnored | HErr::Fallback(_))) => {
+            Err(e @ (HErr::Paused | HErr::RangeIgnored | HErr::LinkExpired | HErr::Fallback(_))) => {
+                sh.release(idx);
                 sh.set_failure(e);
                 return;
             }
             Err(HErr::Failed(msg)) => {
+                sh.release(idx);
                 match current_stop(stop) {
                     Some(Stop::Pause) => {
                         sh.set_failure(HErr::Paused);
@@ -774,7 +992,6 @@ fn worker_loop(sh: &Shared, agent: &Agent, wid: usize, work: &Path, stop: &Optio
                 }
                 let bad = {
                     let mut g = sh.inner.lock().unwrap();
-                    g.segments[idx].owner = None;
                     g.segments[idx].fails += 1;
                     g.segments[idx].fails >= 6
                 };
@@ -785,6 +1002,51 @@ fn worker_loop(sh: &Shared, agent: &Agent, wid: usize, work: &Path, stop: &Optio
             }
         }
     }
+}
+
+/// Read one response body into `fh`, counting `have` up from its start.
+#[allow(clippy::too_many_arguments)]
+fn pump_single(
+    reader: &mut dyn Read,
+    fh: &mut File,
+    have: &mut u64,
+    prog: &Progress,
+    limiter: &RateLimiter,
+    state_path: &Path,
+    url: &str,
+    info: &ProbeInfo,
+    size: Option<u64>,
+    stop: &Option<Arc<StopFn>>,
+) -> Result<(), HErr> {
+    let mut block = vec![0u8; CHUNK as usize];
+    loop {
+        check_stop(stop)?;
+        let n = reader
+            .read(&mut block)
+            .map_err(|e| HErr::Failed(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        limiter.take(n as u64);
+        fh.write_all(&block[..n])
+            .map_err(|e| HErr::Failed(e.to_string()))?;
+        *have += n as u64;
+        prog.add(n as u64);
+        prog.push(false);
+        state_save(
+            state_path,
+            &state_dict(
+                url,
+                info,
+                vec![SegRow {
+                    start: 0,
+                    end: size.unwrap_or(*have),
+                    done: *have,
+                }],
+            ),
+        );
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------- single --
@@ -844,12 +1106,39 @@ fn download_single(
         }
         Err(e) => return Err(HErr::Failed(e.to_string())),
     };
-    if byte_range.is_some() && resp.status() != 206 {
-        have = 0; // server ignored our resume point
+    // Validate the resume before trusting a byte of it: a 200 (Range
+    // ignored) or a 206 starting anywhere else would glue wrong bytes
+    // onto our good prefix.
+    let untrusted = if byte_range.is_some() {
+        let starts_right = match resp.header("Content-Range").and_then(parse_content_range) {
+            Some((cstart, _, _)) => cstart == have,
+            None => true,
+        };
+        resp.status() != 206 || !starts_right
+    } else {
+        false
+    };
+    if untrusted {
+        drop(resp);
+        have = 0;
         prog.set_done(0);
-    }
-    let mut reader = resp.into_reader();
-    {
+        // Fresh, honest stream from byte 0 — the response above was
+        // discarded unread rather than glued onto our prefix.
+        let resp2 = match agent.get(url).call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, _)) => {
+                return Err(HErr::Failed(format!("HTTP {}", code)))
+            }
+            Err(e) => return Err(HErr::Failed(e.to_string())),
+        };
+        let mut reader = resp2.into_reader();
+        let mut fh = File::create(work).map_err(|e| HErr::Failed(e.to_string()))?;
+        pump_single(
+            &mut reader, &mut fh, &mut have, &prog, &limiter, state_path, url, info, size,
+            should_stop,
+        )?;
+    } else {
+        let mut reader = resp.into_reader();
         let mut fh = if have > 0 {
             OpenOptions::new()
                 .append(true)
@@ -858,34 +1147,10 @@ fn download_single(
         } else {
             File::create(work).map_err(|e| HErr::Failed(e.to_string()))?
         };
-        loop {
-            check_stop(should_stop)?;
-            let mut block = vec![0u8; CHUNK as usize];
-            let n = reader
-                .read(&mut block)
-                .map_err(|e| HErr::Failed(e.to_string()))?;
-            if n == 0 {
-                break;
-            }
-            block.truncate(n);
-            limiter.take(n as u64);
-            fh.write_all(&block).map_err(|e| HErr::Failed(e.to_string()))?;
-            have += n as u64;
-            prog.add(n as u64);
-            prog.push(false);
-            state_save(
-                state_path,
-                &state_dict(
-                    url,
-                    info,
-                    vec![SegRow {
-                        start: 0,
-                        end: size.unwrap_or(have),
-                        done: have,
-                    }],
-                ),
-            );
-        }
+        pump_single(
+            &mut reader, &mut fh, &mut have, &prog, &limiter, state_path, url, info, size,
+            should_stop,
+        )?;
     }
 
     if let Some(sz) = size {

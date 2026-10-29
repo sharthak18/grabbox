@@ -20,7 +20,7 @@ import time
 import traceback
 import uuid
 
-from . import horse, sniff, ytdlp_env as env
+from . import horse, sniff, ytdlp_env as env, zipeek
 
 try:
     import yt_dlp
@@ -664,7 +664,7 @@ def probe_url(url, cookies=None):
     result = {"ok": False, "url": url, "kind": "other", "title": url,
               "formats": [], "entries": [], "is_playlist": False, "thumb": None,
               "duration": None, "uploader": None, "direct": None,
-              "error": None, "hint": None, "note": None}
+              "archive_entries": [], "error": None, "hint": None, "note": None}
 
     # A HEAD request settles direct files (images, installers, archives) without
     # touching an extractor, and tells us the size up front.
@@ -672,6 +672,13 @@ def probe_url(url, cookies=None):
     if direct["ok"] and direct["kind"] in DIRECT_KINDS:
         result.update(ok=True, kind=direct["kind"], direct=direct,
                       title=direct["filename"] or url)
+        if direct["kind"] == "archive":
+            # Peek inside before downloading: 1-2 range requests list a
+            # remote ZIP's contents (zipeek). Best-effort — a peek that
+            # fails simply isn't shown.
+            entries = zipeek.list_remote(url)
+            if entries:
+                result["archive_entries"] = entries
         return result
 
     if yt_dlp is None:
