@@ -12,13 +12,16 @@ on **IDM** (desktop download managers) and **VidMate/Snaptube** (mobile):
 
 | Trick | Where | How |
 |---|---|---|
-| Multi-connection segments | Direct files (Python core) | `grabbox/horse.py`: the file is split into up to **16 byte ranges**, each pulled by its own connection into a pre-sized `.part`. A server that throttles *per connection* suddenly serves N× faster. Servers that lie about Range support degrade quietly to one stream. |
+| Multi-connection segments | Direct files (Python core) | `grabbox/horse.py`: up to **16 connections** pull byte ranges into a pre-sized `.part`. A server that throttles *per connection* suddenly serves N× faster. Servers that lie about Range support degrade quietly to one stream. |
+| Work-stealing splits | Direct files (Python core) | Segmentation is **dynamic**, not fixed (design credit: DownloadCraft's MIT engine — see `NOTICE.md`): one segment to start; a free connection takes orphaned work or **splits the segment that would finish last**, proportionally to measured speeds. A connection that turns out slow keeps a small share instead of parking a fixed quarter of the file. 429/503 answers back off and retry instead of failing the download. |
 | Concurrent fragments | Everything yt-dlp serves (all stacks) | `--concurrent-fragments N` + `--http-chunk-size 10M` + 1 MB buffers — HLS/DASH (YouTube & friends) downloads its pieces in parallel instead of one by one. |
 | Patient retries | yt-dlp path | 10 retries with **exponential backoff** sleeps instead of hammering a throttling server into a longer ban. |
 
 Measured on a per-connection-throttled local server (the IDM home turf):
 **3.97 s single-connection → 1.29 s with 6 segments (3.1×)** —
-`python3 -m unittest tests.test_horse -v` reproduces it.
+`python3 -m unittest tests.test_horse -v` reproduces it. And when the
+*first* connection is the slow one (60 KB/s vs 900 KB/s for the rest),
+work-stealing lands a 6 MB file in **~6 s where fixed split needs ≥26 s**.
 
 Settings (shared keys in `~/.grabbox/config.json`, same file every
 engine reads):
