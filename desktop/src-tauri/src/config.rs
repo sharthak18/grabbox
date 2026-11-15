@@ -11,6 +11,31 @@ pub struct Config {
     data: Mutex<Map<String, Value>>,
 }
 
+/// Untrusted folder setting -> a usable absolute path, or an error message.
+/// Trims quotes/space, expands `~/`, creates the folder if needed.
+pub fn normalize_dir(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'').trim();
+    if trimmed.is_empty() {
+        return Ok(default_map()["download_dir"]
+            .as_str()
+            .unwrap_or(".")
+            .to_string());
+    }
+    let expanded = match trimmed.strip_prefix("~/") {
+        Some(rest) => match dirs::home_dir() {
+            Some(home) => home.join(rest).to_string_lossy().into_owned(),
+            None => trimmed.to_string(),
+        },
+        None => trimmed.to_string(),
+    };
+    std::fs::create_dir_all(&expanded)
+        .map_err(|e| format!("Can't use that folder — {e}"))?;
+    if !std::path::Path::new(&expanded).is_dir() {
+        return Err("That path is not a folder.".to_string());
+    }
+    Ok(expanded)
+}
+
 impl Config {
     pub fn load() -> Self {
         let path = dirs::home_dir()
@@ -71,9 +96,16 @@ impl Config {
             .unwrap_or(false)
     }
 
-    pub fn update(&self, patch: &Value) {
+    /// Returns an error (and changes nothing) if a patch value is unusable.
+    pub fn update(&self, patch: &Value) -> Result<(), String> {
+        let mut patched = patch.clone();
+        if let Some(raw) = patched.get("download_dir") {
+            let text = raw.as_str().ok_or_else(|| "download_dir must be text".to_string())?;
+            let norm = normalize_dir(text)?;
+            patched["download_dir"] = json!(norm);
+        }
         let mut data = self.data.lock().unwrap();
-        if let Value::Object(map) = patch {
+        if let Value::Object(map) = &patched {
             for (key, value) in map {
                 if data.contains_key(key) {
                     data.insert(key.clone(), value.clone());
@@ -82,6 +114,7 @@ impl Config {
         }
         drop(data);
         self.save();
+        Ok(())
     }
 
     pub fn to_json(&self) -> Value {
@@ -89,20 +122,14 @@ impl Config {
     }
 
     pub fn download_dir(&self) -> String {
-        let mut dir = self.get_string("download_dir");
-        if dir.is_empty() {
-            dir = default_map()["download_dir"]
+        let dir = self.get_string("download_dir");
+        match normalize_dir(&dir) {
+            Ok(d) => d,
+            Err(_) => default_map()["download_dir"]
                 .as_str()
-                .unwrap_or("")
-                .to_string();
+                .unwrap_or(".")
+                .to_string(),
         }
-        if let Some(rest) = dir.strip_prefix("~/") {
-            if let Some(home) = dirs::home_dir() {
-                dir = home.join(rest).to_string_lossy().into_owned();
-            }
-        }
-        let _ = fs::create_dir_all(&dir);
-        dir
     }
 }
 

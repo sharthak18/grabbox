@@ -18,3 +18,22 @@ noted, design details — from other open-source projects:
 
 Thank you to the DownloadCraft author for publishing a clean,
 readable engine.
+
+## UI design references (no code copied)
+
+The desktop/web UI redesign (sidebar shell, task cards, settings page)
+was informed by studying these projects' interfaces. All GrabBox UI code
+is original, written from scratch against GrabBox's own driver layer:
+
+- **Motrix Next** (https://github.com/AnInsomniacy/motrix-next, MIT) —
+  sidebar destinations with live counts, task-list card language,
+  preference page split into cards, M3 tonal palette approach.
+- **AB Download Manager** (https://github.com/amir1376/ab-download-manager,
+  Apache-2.0) — IDM-style status categories, dense file rows with
+  inline actions.
+- **Gopeed** (https://github.com/GopeedLab/gopeed, GPL-3.0) — permanent
+  "add link" bar instead of a buried add dialog.
+- **Rayburst** (https://github.com/AnInsomniacy/rayburst, MIT) —
+  speed-first status presentation.
+
+Thank you to their authors for proving what a good download UI feels like.
