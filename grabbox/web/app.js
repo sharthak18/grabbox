@@ -11,6 +11,39 @@
 const $ = (sel) => document.querySelector(sel);
 const on = (el, ev, fn) => el.addEventListener(ev, fn);
 
+/* ============================================================ router === */
+
+let jobFilter = "all";         // downloads view filter: all | active | done | failed
+const VIEWS = ["downloads", "files", "settings"];
+
+function go(view, filter) {
+  if (!VIEWS.includes(view)) view = "downloads";
+  if (filter) jobFilter = filter;
+  document.querySelectorAll(".view").forEach((v) =>
+    v.classList.toggle("on", v.id === "view-" + view));
+  document.querySelectorAll("#sidebar .nav-item[data-view]").forEach((b) => {
+    const on_ = b.dataset.view === view &&
+      (view !== "downloads" || (b.dataset.filter || "all") === jobFilter);
+    b.classList.toggle("on", on_);
+  });
+  if (view === "downloads") {
+    const seg = $("#jobFilter");
+    if (seg) seg.querySelectorAll("button").forEach((b) =>
+      b.classList.toggle("on", b.dataset.filter === jobFilter));
+  }
+  try { localStorage.setItem("grabbox:view", view); } catch (e) {}
+  if (view === "files") loadFiles();
+  if (view === "settings") fillSettings();
+  window.scrollTo(0, 0);
+}
+
+function jobMatches(j, filter) {
+  if (filter === "active") return j.status === "running" || j.status === "queued" || j.status === "paused" || j.status === "retrying";
+  if (filter === "done")   return j.status === "done";
+  if (filter === "failed") return j.status === "error" || j.status === "canceled";
+  return true;
+}
+
 /* ============================================================ driver === */
 
 function httpDriver() {
@@ -239,7 +272,7 @@ async function loadHealth() {
 function setPill(text, cls) {
   const pill = $("#health");
   pill.textContent = text;
-  pill.className = "pill " + cls;
+  pill.className = "health-pill " + cls;
   if (!health) return;
   pill.title = [
     `yt-dlp ${health.ytdlp || "?"} (${health.ytdlp_age ?? "?"} days old)`,
@@ -256,6 +289,7 @@ async function analyze(url) {
   url = (url || "").trim();
   if (!url) return toast("Paste a link first");
 
+  go("downloads");
   $("#result").classList.remove("hidden");
   $("#result").scrollIntoView({ behavior: "smooth", block: "nearest" });
   $("#rBadge").textContent = "Analyzing";
@@ -469,6 +503,10 @@ async function startDownload() {
 let lastJobState = "";
 let jobsScheduled = false;
 const notified = new Set();
+const JOB_KIND_ICON = {
+  video: "🎬", audio: "🎵", image: "🖼️", app: "📦",
+  archive: "🗜️", document: "📄", file: "⬇️", other: "⬇️",
+};
 
 async function refreshJobs(force) {
   // Coalesce rapid calls into one animation-frame paint to keep 60fps even
@@ -479,19 +517,35 @@ async function refreshJobs(force) {
   jobsScheduled = false;
   let data;
   try { data = await driver.jobs(); } catch (e) { return; }
-  const jobs = (data.jobs || []).slice().reverse();
-  const key = JSON.stringify(jobs.map((j) => [j.id, j.status, Math.round(j.percent*10)/10, j.filename, j.attempt, j.items_done, j.items_total]));
+  const allJobs = (data.jobs || []).slice().reverse();
+  const key = JSON.stringify(allJobs.map((j) => [j.id, j.status, Math.round(j.percent*10)/10, j.filename, j.attempt, j.items_done, j.items_total]));
   if (!force && key === lastJobState) return;
   const hadRunning = lastJobState.includes('"running"');
   lastJobState = key;
 
+  // sidebar badges + aggregate speed
+  const running = allJobs.filter((j) => jobMatches(j, "active"));
+  const done = allJobs.filter((j) => j.status === "done").length;
+  const failed = allJobs.filter((j) => j.status === "error" || j.status === "canceled").length;
+  const speed = running.reduce((acc, j) => acc + (j.speed || 0), 0);
+  setBadge("#badgeRunning", running.length);
+  setBadge("#badgeDone", done);
+  setBadge("#badgeFailed", failed);
+  const sn = $("#speedNow");
+  if (sn) sn.textContent = `↓ ${speed ? fmtBytes(speed) + "/s" : "0 B/s"}`;
+  const st = $("#statLine");
+  if (st) st.textContent = running.length
+    ? `${running.length} active · ↓ ${fmtBytes(speed)}/s`
+    : (allJobs.length ? `${allJobs.length} in list` : "");
+
+  const jobs = allJobs.filter((j) => jobMatches(j, jobFilter));
   const box = $("#jobs");
   // Preserve focus if a button inside the box is currently active, so cancel
   // clicks don't get eaten by a re-render mid-click.
   const activeId = document.activeElement && document.activeElement.dataset
     && document.activeElement.dataset.cancel;
   if (!jobs.length) {
-    box.innerHTML = `<div class="empty">Nothing downloading yet.<br>Paste a link above — it shows up here with live progress.</div>`;
+    box.innerHTML = emptyState(jobFilter);
   } else {
     box.innerHTML = jobs.map(jobCard).join("");
     box.querySelectorAll("[data-cancel]").forEach((b) =>
@@ -511,44 +565,61 @@ async function refreshJobs(force) {
       if (btn) btn.focus();
     }
   }
-  jobs.forEach((j) => {
+  allJobs.forEach((j) => {
     if (j.status === "done" && !notified.has(j.id)) {
       notified.add(j.id);
       notifyDone(j);
     }
   });
-  if (hadRunning && !jobs.some((j) => j.status === "running")) loadFiles();
+  if (hadRunning && !allJobs.some((j) => j.status === "running")) loadFiles();
+}
+
+function setBadge(sel, n) {
+  const el = $(sel);
+  if (!el) return;
+  el.textContent = String(n);
+  el.classList.toggle("hidden", !n);
+}
+
+function emptyState(filter) {
+  if (filter === "done") return `<div class="empty"><span class="big-glyph">✅</span>Nothing completed yet.<br>Finished downloads land here.</div>`;
+  if (filter === "failed") return `<div class="empty"><span class="big-glyph">🎉</span>No failures.<br>That is how it should be.</div>`;
+  if (filter === "active") return `<div class="empty"><span class="big-glyph">🐎</span>Nothing running right now.<br>Paste a link above and hit <b>Grab</b>.</div>`;
+  return `<div class="empty"><span class="big-glyph">📦</span>Your grabs will appear here.<br>Paste a link above — progress, speed and ETA, live.</div>`;
 }
 
 function jobCard(j) {
-  const cls = j.status === "done" ? "done" : (j.status === "error" || j.status === "canceled") ? "error" : "";
+  const st = j.status || "queued";
+  const cls = st === "done" ? "done" : (st === "error" || st === "canceled") ? "error" : st === "paused" ? "paused" : "running";
   const pct = j.percent ? `${Math.max(0, Math.min(100, j.percent)).toFixed(0)}%` : "";
   const parts = [];
   if (j.speed) parts.push(`${fmtBytes(j.speed)}/s`);
   if (j.eta) parts.push(`${Math.round(j.eta)}s left`);
-  if (j.segments > 1 && (j.status === "running" || j.status === "paused")) parts.push(`⚡×${j.segments}`);
+  if (j.segments > 1 && (st === "running" || st === "paused")) parts.push(`⚡×${j.segments}`);
   if (j.size && j.downloaded) parts.push(`${fmtBytes(j.downloaded)} / ${fmtBytes(j.size)}`);
   if (j.items_total) parts.push(`item ${j.items_done || 1}/${j.items_total}`);
-  if (j.attempts_total > 1 && j.status !== "paused") parts.push(`attempt ${j.attempt}/${j.attempts_total}`);
+  if (j.attempts_total > 1 && st !== "paused") parts.push(`attempt ${j.attempt}/${j.attempts_total}`);
   const w = Math.max(0, Math.min(100, j.percent || 0));
+  const icon = JOB_KIND_ICON[j.kind] || JOB_KIND_ICON.file;
   return `
-  <div class="job ${cls}">
-    <div class="job-top">
+  <div class="job ${cls} ${st}">
+    <div class="job-ico">${icon}</div>
+    <div class="job-mid">
       <div class="job-title" title="${escapeAttr(j.filename || j.title || j.url)}">${escapeHtml(j.filename || j.title || j.url)}</div>
-      <div class="job-actions">
-        ${j.status === "running" ? `<button class="icon-btn" data-pause="${j.id}" title="Pause (keeps every byte)" aria-label="Pause"><svg><use href="#i-pause"/></svg></button>` : ""}
-        ${j.status === "queued" ? `<button class="icon-btn" data-pause="${j.id}" title="Hold" aria-label="Pause"><svg><use href="#i-pause"/></svg></button>` : ""}
-        ${j.status === "paused" ? `<button class="icon-btn" data-resume="${j.id}" title="Resume" aria-label="Resume"><svg><use href="#i-play"/></svg></button>` : ""}
-        ${j.status === "error" || j.status === "canceled" ? `<button class="icon-btn" data-retry="${j.id}" title="Retry (resumes partial file)" aria-label="Retry"><svg><use href="#i-retry"/></svg></button>` : ""}
-        ${j.status === "running" || j.status === "queued" || j.status === "paused" ? `<button class="icon-btn" data-cancel="${j.id}" title="Stop" aria-label="Stop"><svg><use href="#i-close"/></svg></button>` : ""}
-        ${j.status === "done" && j.path ? `<button class="icon-btn" data-play="${escapeAttr(j.path)}" title="Play / open" aria-label="Open"><svg><use href="#i-play"/></svg></button>
-          <button class="icon-btn" data-show="${escapeAttr(j.path)}" title="Show in folder" aria-label="Show in folder"><svg><use href="#i-folder"/></svg></button>` : ""}
-      </div>
+      <div class="job-sub"><span class="job-status">${escapeHtml(st)}</span>${pct ? `<span>${pct}</span>` : ""}${parts.length ? `<span>${parts.join(" · ")}</span>` : ""}</div>
+      <div class="bar"><i style="width:${w}%"></i></div>
+      ${st === "error" && j.error ? `<div class="err">${escapeHtml(j.error)}</div>` : ""}
+      ${j.hint ? `<div class="hint">💡 ${escapeHtml(j.hint)}</div>` : ""}
     </div>
-    <div class="job-sub"><span class="job-status">${j.status}</span>${pct ? " · " + pct : ""}${parts.length ? " · " + parts.join(" · ") : ""}</div>
-    <div class="bar"><i style="width:${w}%"></i></div>
-    ${j.status === "error" && j.error ? `<div class="err">${escapeHtml(j.error)}</div>` : ""}
-    ${j.hint ? `<div class="hint">💡 ${escapeHtml(j.hint)}</div>` : ""}
+    <div class="job-actions">
+      ${st === "running" ? `<button class="icon-btn" data-pause="${j.id}" title="Pause (keeps every byte)" aria-label="Pause"><svg><use href="#i-pause"/></svg></button>` : ""}
+      ${st === "queued" ? `<button class="icon-btn" data-pause="${j.id}" title="Hold" aria-label="Pause"><svg><use href="#i-pause"/></svg></button>` : ""}
+      ${st === "paused" ? `<button class="icon-btn" data-resume="${j.id}" title="Resume" aria-label="Resume"><svg><use href="#i-play"/></svg></button>` : ""}
+      ${st === "error" || st === "canceled" ? `<button class="icon-btn" data-retry="${j.id}" title="Retry (resumes partial file)" aria-label="Retry"><svg><use href="#i-retry"/></svg></button>` : ""}
+      ${st === "running" || st === "queued" || st === "paused" ? `<button class="icon-btn danger" data-cancel="${j.id}" title="Stop" aria-label="Stop"><svg><use href="#i-close"/></svg></button>` : ""}
+      ${st === "done" && j.path ? `<button class="icon-btn" data-play="${escapeAttr(j.path)}" title="Play / open" aria-label="Open"><svg><use href="#i-play"/></svg></button>
+        <button class="icon-btn" data-show="${escapeAttr(j.path)}" title="Show in folder" aria-label="Show in folder"><svg><use href="#i-folder"/></svg></button>` : ""}
+    </div>
   </div>`;
 }
 
@@ -601,8 +672,8 @@ async function loadConfigOnce() {
 
 /* ------------------------------------------------------------ settings -- */
 
-async function openSettings() {
-  config = await driver.getConfig();
+async function fillSettings() {
+  try { config = await driver.getConfig(); } catch (e) { config = config || {}; }
   $("#sDir").value = config.download_dir || "";
   $("#sConc").value = String(config.concurrency || 2);
   $("#sCookies").value = config.cookies_browser || "";
@@ -611,7 +682,9 @@ async function openSettings() {
   if ($("#sLimit")) $("#sLimit").value = String(config.speed_limit_kbps || 0);
   if ($("#sTurbo")) $("#sTurbo").checked = config.turbo !== false;
   if (driver.pickFolder) $("#sBrowse").classList.remove("hidden");
-  const h = await driver.health();
+  let h = null;
+  try { h = await driver.health(); } catch (e) {}
+  if (!h) { $("#sHealth").textContent = "health check failed"; return; }
   $("#sHealth").textContent = [
     `yt-dlp      ${h.ytdlp || "MISSING"}  (${h.ytdlp_age ?? "?"} days old)`,
     `ffmpeg      ${h.ffmpeg || "MISSING"}`,
@@ -621,20 +694,24 @@ async function openSettings() {
     h.pot_provider ? `POT plugin  ${h.pot_provider}` : null,
     `update      ${h.update_hint}`,
   ].filter((l) => l !== null).join("\n");
-  openDlg("settings");
 }
 
 async function saveSettings() {
-  await driver.setConfig({
-    download_dir: $("#sDir").value.trim(),
-    concurrency: Math.max(1, parseInt($("#sConc").value || "2", 10)),
-    cookies_browser: $("#sCookies").value,
-    watch_clipboard: $("#sClip").checked,
-    connections: Math.max(1, Math.min(16, parseInt(($("#sConn") || {}).value || "8", 10) || 8)),
-    speed_limit_kbps: Math.max(0, parseInt(($("#sLimit") || {}).value || "0", 10) || 0),
-    turbo: $("#sTurbo") ? $("#sTurbo").checked : true,
-  });
-  closeDlg("settings");
+  try {
+    config = await driver.setConfig({
+      download_dir: $("#sDir").value.trim(),
+      concurrency: Math.max(1, parseInt($("#sConc").value || "2", 10)),
+      cookies_browser: $("#sCookies").value,
+      watch_clipboard: $("#sClip").checked,
+      connections: Math.max(1, Math.min(16, parseInt(($("#sConn") || {}).value || "8", 10) || 8)),
+      speed_limit_kbps: Math.max(0, parseInt(($("#sLimit") || {}).value || "0", 10) || 0),
+      turbo: $("#sTurbo") ? $("#sTurbo").checked : true,
+    });
+    $("#sDir").value = config.download_dir || $("#sDir").value;
+  } catch (e) {
+    toast("Could not save: " + String(e).replace(/^Error:\s*/, ""));
+    return;
+  }
   toast("Settings saved");
   loadHealth();
   loadFiles();
@@ -826,12 +903,14 @@ document.addEventListener("DOMContentLoaded", () => {
   on($("#rClose"), "click", () => $("#result").classList.add("hidden"));
   on($("#clearJobs"), "click", async () => { await driver.clearJobs(); lastJobState = ""; refreshJobs(true); });
   on($("#openDir"), "click", () => driver.fileAction(null, "reveal"));
-  on($("#settingsBtn"), "click", openSettings);
-  on($("#health"), "click", openSettings);
-  on($("#setupGo"), "click", openSettings);
+  document.querySelectorAll("#sidebar .nav-item[data-view]").forEach((b) =>
+    on(b, "click", () => go(b.dataset.view, b.dataset.filter)));
+  const jf = $("#jobFilter");
+  if (jf) jf.querySelectorAll("button").forEach((b) =>
+    on(b, "click", () => go("downloads", b.dataset.filter)));
+  on($("#health"), "click", () => go("settings"));
+  on($("#setupGo"), "click", () => go("settings"));
   on($("#sSave"), "click", saveSettings);
-  on($("#themeBtn"), "click", () => { renderThemeDialog(); openDlg("themeDlg"); });
-  on($("#feedbackBtn"), "click", sendFeedback);
   on($("#sFeedback"), "click", sendFeedback);
   on($("#sExtension"), "click", openExtensionGuide);
   on($("#sUpdate"), "click", async () => {
@@ -842,8 +921,12 @@ document.addEventListener("DOMContentLoaded", () => {
   on($("#extOpenFolder"), "click", () => driver.openExtensionFolder && driver.openExtensionFolder());
   on($("#sBrowse"), "click", async () => {
     if (!driver.pickFolder) return;
-    const dir = await driver.pickFolder();
-    if (dir) $("#sDir").value = dir;
+    try {
+      const dir = await driver.pickFolder();
+      if (dir) $("#sDir").value = dir;
+    } catch (e) {
+      toast("Folder picker failed: " + String(e).replace(/^Error:\s*/, ""));
+    }
   });
   on($("#clipHint"), "click", () => {
     const u = $("#clipHint").dataset.url;
@@ -870,6 +953,12 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   setupDragDrop();
+
+  // restore the last view (downloads by default)
+  try {
+    const last = localStorage.getItem("grabbox:view");
+    if (last === "files" || last === "settings") go(last);
+  } catch (e) {}
 
   // The browser extension opens /?url=... — keep that entry point working.
   const q = new URLSearchParams(location.search);

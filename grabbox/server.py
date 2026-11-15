@@ -205,7 +205,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/config":
             prev_conc = int(self.config.get("concurrency", 2))
-            self.config.update(body)
+            try:
+                self.config.update(body)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             new_conc = int(self.config.get("concurrency", 2))
             # If concurrency changed, rebuild the manager's semaphore so the
             # new limit takes effect for subsequent jobs.

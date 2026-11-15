@@ -23,6 +23,23 @@ CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".grabbox")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
 
+def normalize_dir(raw):
+    """Untrusted folder setting -> a usable absolute path, or None.
+
+    Trims quotes/space, expands ~, creates the folder if needed and checks
+    it is a directory. Empty input means "the default location".
+    """
+    text = (raw or "").strip().strip('"').strip("'").strip()
+    if not text:
+        return DEFAULT_DIR
+    text = os.path.abspath(os.path.expanduser(text.rstrip("/\\") or text))
+    try:
+        os.makedirs(text, exist_ok=True)
+    except OSError:
+        return None
+    return text if os.path.isdir(text) else None
+
+
 class Config(object):
     def __init__(self, path=CONFIG_FILE):
         self.path = path
@@ -63,15 +80,16 @@ class Config(object):
 
     def update(self, mapping):
         for key, value in (mapping or {}).items():
-            if key in DEFAULTS:
-                self.data[key] = value
+            if key not in DEFAULTS:
+                continue
+            if key == "download_dir":
+                norm = normalize_dir(value)
+                if norm is None:
+                    raise ValueError("can't use that folder — it doesn't exist and can't be created")
+                value = norm
+            self.data[key] = value
         self.save()
 
     def download_dir(self):
         d = self.get("download_dir") or DEFAULT_DIR
-        d = os.path.expanduser(d)
-        try:
-            os.makedirs(d, exist_ok=True)
-        except OSError:
-            pass
-        return d
+        return normalize_dir(d) or DEFAULT_DIR

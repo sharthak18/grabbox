@@ -191,7 +191,7 @@ fn grabbox_get_config(state: tauri::State<'_, AppState>) -> Result<Value, String
 
 #[tauri::command]
 fn grabbox_set_config(state: tauri::State<'_, AppState>, config: Value) -> Result<Value, String> {
-    state.config.update(&config);
+    state.config.update(&config)?;
     Ok(state.config.to_json())
 }
 
@@ -223,16 +223,26 @@ async fn grabbox_update_ytdlp(state: tauri::State<'_, AppState>) -> Result<Value
 }
 
 #[tauri::command]
-fn grabbox_pick_folder(state: tauri::State<'_, AppState>) -> Result<Value, String> {
+async fn grabbox_pick_folder(state: tauri::State<'_, AppState>) -> Result<Value, String> {
     use tauri_plugin_dialog::DialogExt;
-    let picked = state
-        .app
-        .dialog()
-        .file()
-        .set_title("Choose where downloads go")
-        .blocking_pick_folder();
+    let app = state.app.clone();
+    // blocking_pick_folder blocks the calling thread until the portal/dialog
+    // answers — keep it off the main thread and turn any failure (including a
+    // panic inside the dialog backend) into an error string.
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("Choose where downloads go")
+            .blocking_pick_folder()
+    })
+    .await
+    .map_err(|e| format!("folder dialog failed: {e}"))?;
     match picked {
-        Some(p) => Ok(Value::String(p.to_string())),
+        Some(p) => {
+            let raw = p.to_string();
+            let dir = config::normalize_dir(&raw)?;
+            Ok(Value::String(dir))
+        }
         None => Ok(Value::Null),
     }
 }
