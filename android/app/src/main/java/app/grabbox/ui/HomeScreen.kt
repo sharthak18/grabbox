@@ -27,10 +27,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.MailOutline
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -531,7 +531,7 @@ private fun SettingsDialog(vm: GrabViewModel) {
                         onClick = { dirPicker.launch(null) },
                     )
                     TextButton(onClick = { dirPicker.launch(null) }) {
-                        Icon(Icons.Default.FolderOpen, contentDescription = null)
+                        Icon(Icons.Default.CreateNewFolder, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
                         Text("Custom folder…")
                     }
@@ -542,7 +542,7 @@ private fun SettingsDialog(vm: GrabViewModel) {
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 2,
-                        overflow = TextOverflow.MiddleEllipsis,
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
                 Text("🐎 Horse — download engine", style = MaterialTheme.typography.titleSmall)
