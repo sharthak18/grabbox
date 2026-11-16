@@ -1,5 +1,11 @@
 package app.grabbox.ui
 
+import android.content.Intent
+import android.net.Uri
+import android.provider.DocumentsContract
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -24,6 +30,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MailOutline
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -489,6 +496,55 @@ private fun SettingsDialog(vm: GrabViewModel) {
                         Text(label, style = MaterialTheme.typography.bodyMedium)
                     }
                 }
+                // Flexible option: any folder on shared storage (incl. SD card).
+                val customSelected = vm.dirOptions.none { it.first == vm.downloadDir }
+                val dirPicker = rememberLauncherForActivityResult(
+                    ActivityResultContracts.OpenDocumentTree()
+                ) { uri ->
+                    if (uri == null) return@rememberLauncherForActivityResult
+                    try {
+                        context.contentResolver.takePersistableUriPermission(
+                            uri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                        )
+                    } catch (e: Exception) { /* mapped path works without it */ }
+                    val path = treeUriToPath(uri)
+                    val ok = path != null && runCatching {
+                        java.io.File(path).mkdirs()
+                        java.io.File(path).isDirectory && java.io.File(path).canWrite()
+                    }.getOrDefault(false)
+                    if (ok && path != null) {
+                        vm.setDir(path)
+                        Toast.makeText(context, "Downloads will save to $path", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(
+                            context,
+                            "That folder can't be used — pick one in shared storage",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    RadioButton(
+                        selected = customSelected,
+                        onClick = { dirPicker.launch(null) },
+                    )
+                    TextButton(onClick = { dirPicker.launch(null) }) {
+                        Icon(Icons.Default.FolderOpen, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Custom folder…")
+                    }
+                }
+                if (customSelected) {
+                    Text(
+                        vm.downloadDir,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.MiddleEllipsis,
+                    )
+                }
                 Text("🐎 Horse — download engine", style = MaterialTheme.typography.titleSmall)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
@@ -538,6 +594,28 @@ private fun SettingsDialog(vm: GrabViewModel) {
             }
         },
     )
+}
+
+/** Map a SAF tree URI back to a shared-storage path. Works for the primary
+ *  volume ("primary:Download/GrabBox" -> /storage/emulated/0/Download/GrabBox)
+ *  and for removable volumes ("<vol-id>:…" -> /storage/<vol-id>/…). Returns
+ *  null when the volume can't be mapped. */
+private fun treeUriToPath(uri: Uri): String? = try {
+    val docId = DocumentsContract.getTreeDocumentId(uri)
+    val volume = docId.substringBefore(':', "")
+    val rel = docId.substringAfter(':', "")
+    if (volume.isBlank()) {
+        null
+    } else {
+        val base = if (volume.equals("primary", ignoreCase = true)) {
+            android.os.Environment.getExternalStorageDirectory().absolutePath
+        } else {
+            "/storage/$volume"
+        }
+        if (rel.isBlank()) base else "$base/$rel"
+    }
+} catch (e: Exception) {
+    null
 }
 
 // ------------------------------------------------------------- helpers --
