@@ -203,6 +203,30 @@
         </div>
       </section>
 
+      <!-- torrent file picker (desktop only) -->
+      <section id="torrentSheet" class="sheet hidden" aria-live="polite">
+        <button id="tClose" class="icon-btn sheet-close" title="Cancel" aria-label="Cancel"><svg><use href="#i-close"/></svg></button>
+        <div class="sheet-head">
+          <div class="thumb-wrap"><svg class="thumb-ph t-magnet"><use href="#i-magnet"/></svg></div>
+          <div class="sheet-meta">
+            <span id="tBadge" class="badge">Torrent</span>
+            <h2 id="tTitle">Reading torrent…</h2>
+            <p id="tSub" class="meta-line">Fetching metadata — magnets on quiet swarms can take a moment.</p>
+          </div>
+        </div>
+        <div id="tTools" class="t-tools hidden">
+          <label class="check-row t-all"><input id="tAll" type="checkbox" checked><span>Select all</span></label>
+          <span id="tTotal" class="size-hint"></span>
+        </div>
+        <div id="tFiles" class="t-files hidden"></div>
+        <div id="tActions" class="sheet-actions hidden">
+          <span id="tSel" class="size-hint"></span>
+          <button id="tDownload" class="filled-btn big">
+            <svg class="mini"><use href="#i-download"/></svg><span>Download</span>
+          </button>
+        </div>
+      </section>
+
       <div id="jobs" class="job-list"></div>
     </div>
 
@@ -333,7 +357,7 @@
 <div id="dropOverlay" class="drop-overlay hidden">
   <div class="drop-card">
     <svg class="big-ico"><use href="#i-download"/></svg>
-    <p>Drop the link to grab it</p>
+    <p>Drop a link — or a .torrent file</p>
   </div>
 </div>
 

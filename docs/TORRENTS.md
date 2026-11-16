@@ -5,7 +5,13 @@ Paste a `magnet:` link into the grab bar — or hit the paperclip button and pic
 
 ## What works (desktop)
 
-- **Magnet links** and **.torrent files** (up to 64 MiB of bencode).
+- **Magnet links** and **.torrent files** (up to 64 MiB of bencode). Paste a
+  magnet or drop/pick a `.torrent` — you get a file picker listing everything
+  in the torrent (name + size, select all/none), nothing downloads until you
+  hit **Download**. For magnets the metadata is resolved up front and the
+  torrent is added *paused*; canceling the picker deletes it again.
+- **File selection** end to end: inspect adds paused → engine reports its
+  files → confirm applies `only_files` and unpauses.
 - Same list, same controls: pause / resume / retry, live speed and ETA,
   percent, aggregate into the sidebar badges and the combined ↓ speed readout.
 - **Persistent across restarts** — session state lives in `~/.grabbox/torrents/`
@@ -25,10 +31,9 @@ Paste a `magnet:` link into the grab bar — or hit the paperclip button and pic
   hides the paperclip and says plainly that torrents need the desktop app
   instead of failing silently. A future Android path would bind librqbit over
   FFI, or implement the protocol natively in Kotlin.
-- **Per-torrent file selection** ("only file 3 of 10"), sequential-read
-  preference, bandwidth caps per torrent, and a piece-level progress view.
-  The engine supports all of these (`only_files`, `ratelimits`, piece stats);
-  they are UI + plumbing work, tracked as follow-ups.
+- **Sequential-download preference**, bandwidth caps per torrent, and a
+  piece-level progress view. The engine supports all of these (`ratelimits`,
+  piece stats); they are follow-ups.
 - **RSS auto-download of torrents**, debrid-service unlocking. Planned as a
   separate milestone; the queue hooks are already in place.
 - **Seeding control / ratio limits** — GrabBox keeps finished torrents paused
@@ -45,8 +50,13 @@ only; nothing was copied. See `NOTICE.md`.
 ## Architecture
 
 ```
-grab bar paste ──► isMagnet()? ──► driver.torrentAdd ──► invoke grabbox_torrent_add
-.torrent pick  ──► FileReader(b64) ──► invoke grabbox_torrent_add_file
+grab bar paste ──► isMagnet()? ──► invoke grabbox_torrent_inspect ─┐
+.torrent drop/pick ──► FileReader(b64) ──► invoke grabbox_torrent_inspect_file ─┤
+                                                                   ▼
+                              paused torrent + file list (nothing downloads yet)
+                                                                   ▼
+             user confirms ──► invoke grabbox_torrent_select {only_files, unpause}
+             user cancels  ──► invoke grabbox_torrent_discard (removes the paused torrent)
                                           │
                                           ▼
                             TorrentManager (torrent.rs)

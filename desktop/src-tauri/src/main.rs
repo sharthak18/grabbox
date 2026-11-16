@@ -194,6 +194,55 @@ async fn grabbox_torrent_add_file(
 }
 
 #[tauri::command]
+async fn grabbox_torrent_inspect(
+    state: tauri::State<'_, AppState>,
+    magnet: String,
+) -> Result<Value, String> {
+    let dir = state.config.download_dir();
+    // Magnet metadata can take a while to arrive from peers — cap the wait.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        state.torrents.inspect_magnet(&magnet, &dir),
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(_) => Err("couldn't fetch the torrent's metadata in 90s — check the link".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn grabbox_torrent_inspect_file(
+    state: tauri::State<'_, AppState>,
+    data_b64: String,
+) -> Result<Value, String> {
+    let dir = state.config.download_dir();
+    state.torrents.inspect_torrent_file(&data_b64, &dir).await
+}
+
+#[tauri::command]
+async fn grabbox_torrent_select(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    files: Vec<usize>,
+) -> Result<Value, String> {
+    let id = torrent::parse_torrent_id(&id).ok_or_else(|| "not a torrent job".to_string())?;
+    state.torrents.select(id, files).await?;
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command]
+async fn grabbox_torrent_discard(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<Value, String> {
+    if let Some(id) = torrent::parse_torrent_id(&id) {
+        state.torrents.discard(id).await?;
+    }
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command]
 async fn grabbox_clear_jobs(state: tauri::State<'_, AppState>) -> Result<Value, String> {
     state.manager.clear_finished();
     state.torrents.clear_finished().await;
@@ -427,6 +476,10 @@ pub fn run() {
             grabbox_take_pending_url,
             grabbox_torrent_add,
             grabbox_torrent_add_file,
+            grabbox_torrent_inspect,
+            grabbox_torrent_inspect_file,
+            grabbox_torrent_select,
+            grabbox_torrent_discard,
         ])
         .run(tauri::generate_context!())
         .expect("error while running GrabBox");
