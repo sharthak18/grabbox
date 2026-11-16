@@ -64,6 +64,19 @@ Playlists work the same way — paste the playlist link and every track is numbe
 ## Also in the box
 
 <details>
+<summary><b>Torrents</b> — magnet links and .torrent files in the same queue</summary>
+
+Paste a `magnet:` link into the grab bar (or hit the paperclip to pick a `.torrent` file)
+and it joins the same list as everything else — pause, resume, retry, top speed, piece
+count, all live. Downloads land in your usual GrabBox folder, state persists across
+restarts, and **“Clear finished”** tidies completed rows without ever deleting files.
+
+*Desktop app first* (powered by [librqbit](https://github.com/ikatson/rqbit), Apache-2.0).
+The Python server and Android build can't do torrents yet — they'll say so plainly instead
+of failing silently. Details: [docs/TORRENTS.md](docs/TORRENTS.md).
+</details>
+
+<details>
 <summary><b>Browser extension</b> — download from the page you are on</summary>
 
 A toolbar icon that lights up when a page has something worth grabbing, a right-click

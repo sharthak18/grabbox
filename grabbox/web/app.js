@@ -11,6 +11,47 @@
 const $ = (sel) => document.querySelector(sel);
 const on = (el, ev, fn) => el.addEventListener(ev, fn);
 
+function isMagnet(url) {
+  return /^\s*magnet:/i.test(url || "");
+}
+
+/** Hand a magnet link to the desktop torrent engine (or explain why not). */
+async function addTorrent(magnet) {
+  magnet = (magnet || "").trim();
+  if (!magnet) return false;
+  if (!driver.torrentAdd) {
+    toast("Torrents need the desktop app — the browser build can't open magnet links yet");
+    return false;
+  }
+  try {
+    await driver.torrentAdd(magnet);
+    toast("🧲 Torrent added");
+  } catch (e) {
+    toast("Torrent rejected: " + String(e));
+    return false;
+  }
+  refreshJobs(true);
+  return true;
+}
+
+function addTorrentFile(file) {
+  const reader = new FileReader();
+  reader.onload = async () => {
+    const b64 = String(reader.result || "").split(",", 2)[1] || "";
+    if (!b64) return toast("Could not read that file");
+    if (!driver.torrentAddFile) return toast("Torrents need the desktop app");
+    try {
+      await driver.torrentAddFile(b64);
+      toast("🧲 Torrent added");
+    } catch (e) {
+      toast("Torrent rejected: " + String(e));
+      return;
+    }
+    refreshJobs(true);
+  };
+  reader.readAsDataURL(file);
+}
+
 /* ============================================================ router === */
 
 let jobFilter = "all";         // downloads view filter: all | active | done | failed
@@ -73,6 +114,8 @@ function httpDriver() {
     updateYtdlp: () => post("/api/update-ytdlp"),
     pickFolder: null,               // browsers cannot pick folders
     openExtensionFolder: null,
+    torrentAdd: null,               // torrents are desktop-only for now
+    torrentAddFile: null,
   };
 }
 
@@ -98,6 +141,8 @@ function tauriDriver() {
     updateYtdlp: () => invoke("grabbox_update_ytdlp"),
     pickFolder: () => invoke("grabbox_pick_folder"),
     openExtensionFolder: () => invoke("grabbox_open_extension_folder"),
+    torrentAdd: (magnet) => invoke("grabbox_torrent_add", { magnet }),
+    torrentAddFile: (data_b64) => invoke("grabbox_torrent_add_file", { data_b64 }),
     takePendingUrl: () => invoke("grabbox_take_pending_url"),
     onGrabUrl: (cb) => window.__TAURI__.event.listen("grab-url", (e) => cb(e.payload)),
   };
@@ -288,6 +333,11 @@ function setPill(text, cls) {
 async function analyze(url) {
   url = (url || "").trim();
   if (!url) return toast("Paste a link first");
+  if (isMagnet(url)) {
+    const ok = await addTorrent(url);
+    if (ok) $("#url").value = "";
+    return;
+  }
 
   go("downloads");
   $("#result").classList.remove("hidden");
@@ -454,20 +504,28 @@ function updateSizeHint() {
 
 /** Every http(s) URL in a blob of text (paste, drop, share sheet). */
 function extractUrls(text) {
-  const found = String(text || "").match(/https?:\/\/[^\s<>"']+/g) || [];
+  const found = String(text || "").match(/(magnet:\?[^\s<>"']+|https?:\/\/[^\s<>"']+)/g) || [];
   return [...new Set(found.map((u) => u.replace(/[)\].,;]+$/, "")))];
 }
 
 /** Queue many links at once with the defaults — no probing sheet per link. */
 async function quickQueue(urls) {
   maybeAskNotify();
-  try {
-    const res = await driver.downloadBatch(urls);
-    const n = (res.jobs || []).length || urls.length;
-    toast(`Queued ${n} download${n === 1 ? "" : "s"} 🐎`);
-  } catch (e) {
-    toast(String(e));
+  const magnets = urls.filter(isMagnet);
+  const links = urls.filter((u) => !isMagnet(u));
+  let queued = 0;
+  for (const m of magnets) {
+    if (await addTorrent(m)) queued += 1;
   }
+  if (links.length) {
+    try {
+      const res = await driver.downloadBatch(links);
+      queued += (res.jobs || []).length || links.length;
+    } catch (e) {
+      toast(String(e));
+    }
+  }
+  if (queued) toast(`Queued ${queued} download${queued === 1 ? "" : "s"} 🐎`);
   $("#url").value = "";
   refreshJobs(true);
 }
@@ -506,6 +564,7 @@ const notified = new Set();
 const JOB_KIND_ICON = {
   video: "🎬", audio: "🎵", image: "🖼️", app: "📦",
   archive: "🗜️", document: "📄", file: "⬇️", other: "⬇️",
+  torrent: "🧲",
 };
 
 async function refreshJobs(force) {
@@ -887,6 +946,15 @@ document.addEventListener("DOMContentLoaded", () => {
   setInterval(loadFiles, 5000);
   setInterval(pollClipboard, 1500);
 
+  if (driver.torrentAddFile) {
+    $("#torrentBtn").classList.remove("hidden");
+    on($("#torrentBtn"), "click", () => $("#torrentFile").click());
+    on($("#torrentFile"), "change", (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (f) addTorrentFile(f);
+      e.target.value = "";
+    });
+  }
   on($("#go"), "click", () => analyze($("#url").value));
   on($("#url"), "keydown", (e) => { if (e.key === "Enter") analyze($("#url").value); });
   on($("#url"), "paste", (e) => {

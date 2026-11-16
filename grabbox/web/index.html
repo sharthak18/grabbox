@@ -64,6 +64,8 @@
   <symbol id="i-retry" viewBox="0 0 24 24"><path d="M17.65 6.35A8 8 0 1 0 19.73 14h-2.08a6 6 0 1 1-1.41-6.24L13 11h7V4l-2.35 2.35z" fill="currentColor"/></symbol>
   <symbol id="i-chat" viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-1.99.9-1.99 2L2 22l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM9 11H7V9h2v2zm4 0h-2V9h2v2zm4 0h-2V9h2v2z" fill="currentColor"/></symbol>
   <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M11 21h-1l1-7H7.5c-.58 0-.57-.32-.38-.66l.07-.12C8.48 10.94 10.42 7.54 13 3h1l-1 7h3.5c.49 0 .56.33.37.66l-.07.15C14.96 15.26 12 18.62 11 21z" fill="currentColor"/></symbol>
+  <symbol id="i-magnet" viewBox="0 0 24 24"><path d="M4 3h6v9a2 2 0 0 0 4 0V3h6v9a8 8 0 0 1-16 0V3z" fill="currentColor"/><path d="M4 3h6v4H4zM14 3h6v4h-6z" fill="currentColor" opacity=".55"/></symbol>
+  <symbol id="i-attach" viewBox="0 0 24 24"><path d="M16.5 6v11.5a4 4 0 0 1-8 0V5a2.5 2.5 0 0 1 5 0v10.5a1 1 0 0 1-2 0V6H10v9.5a2.5 2.5 0 0 0 5 0V5a4 4 0 0 0-8 0v12.5a5.5 5.5 0 0 0 11 0V6h-1.5z" fill="currentColor"/></symbol>
 </svg>
 
 <div id="app">
@@ -118,6 +120,10 @@
       <svg class="add-lead"><use href="#i-link"/></svg>
       <input id="url" type="url" placeholder="Paste a link to grab — video, audio, ISO, anything"
              autocomplete="off" spellcheck="false" enterkeyhint="go" aria-label="Link to download">
+      <button id="torrentBtn" class="icon-btn big hidden" title="Add a .torrent file" aria-label="Add a .torrent file">
+        <svg><use href="#i-attach"/></svg>
+      </button>
+      <input type="file" id="torrentFile" accept=".torrent,application/x-bittorrent" class="hidden" aria-hidden="true">
       <button id="go" class="filled-btn grab-btn">
         <svg class="mini"><use href="#i-download"/></svg><span>Grab</span>
       </button>
