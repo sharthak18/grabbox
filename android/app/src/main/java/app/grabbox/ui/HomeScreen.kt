@@ -27,7 +27,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.MailOutline
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -531,8 +530,6 @@ private fun SettingsDialog(vm: GrabViewModel) {
                         onClick = { dirPicker.launch(null) },
                     )
                     TextButton(onClick = { dirPicker.launch(null) }) {
-                        Icon(Icons.Default.CreateNewFolder, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
                         Text("Custom folder…")
                     }
                 }
