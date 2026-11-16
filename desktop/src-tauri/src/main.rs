@@ -90,7 +90,7 @@ async fn grabbox_download(
 
 #[tauri::command]
 fn grabbox_jobs(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    let mut rows = state.manager.list();
+    let mut rows: Vec<Value> = state.manager.list().into_iter().map(|j| json!(j)).collect();
     rows.extend(state.torrents.snapshot());
     Ok(json!(rows))
 }

@@ -25,6 +25,7 @@ ureq = { version = "2.10", default-features = false, features = ["tls"] }
 librqbit = "9.1"
 base64 = "0.22"
 tokio = { version = "1", features = ["sync", "time"] }
+anyhow = "1"
 
 [features]
 # Reused when the tauri.conf is built through the lib target.

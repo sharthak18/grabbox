@@ -16,9 +16,12 @@
 
 use librqbit::api::TorrentIdOrHash;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, DhtSessionConfig, ListenerOptions, Session, SessionOptions,
-    SessionPersistenceConfig, TorrentId, TorrentStatsState,
+    AddTorrent, AddTorrentOptions, DhtSessionConfig, ListenerOptions, ManagedTorrent, Session,
+    SessionOptions, SessionPersistenceConfig, TorrentStatsState,
 };
+// `TorrentId` and the `ManagedTorrentHandle` alias live on private `session`
+// paths in librqbit; both are `usize` / `Arc<ManagedTorrent>` under the hood.
+type TorrentId = usize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -101,8 +104,17 @@ impl TorrentManager {
             .cloned()
     }
 
-    fn handle(session: &Session, id: TorrentId) -> Option<librqbit::ManagedTorrentHandle> {
-        session.with_torrents(|it| it.find(|(tid, _)| *tid == id).map(|(_, h)| h.clone()))
+    fn handle(session: &Session, id: TorrentId) -> Option<Arc<ManagedTorrent>> {
+        session.with_torrents(|it| {
+            let mut hit = None;
+            for (tid, handle) in it {
+                if tid == id {
+                    hit = Some(handle.clone());
+                    break;
+                }
+            }
+            hit
+        })
     }
 
     /// Create the session if the user has persisted torrent state (fastresume
