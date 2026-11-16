@@ -756,6 +756,7 @@ function jobCard(j) {
   const pct = j.percent ? `${Math.max(0, Math.min(100, j.percent)).toFixed(0)}%` : "";
   const parts = [];
   if (j.speed) parts.push(`${fmtBytes(j.speed)}/s`);
+  if (j.upload_speed) parts.push(`↑ ${fmtBytes(j.upload_speed)}/s`);
   if (j.eta) parts.push(`${Math.round(j.eta)}s left`);
   if (j.segments > 1 && (st === "running" || st === "paused")) parts.push(`⚡×${j.segments}`);
   if (j.size && j.downloaded) parts.push(`${fmtBytes(j.downloaded)} / ${fmtBytes(j.size)}`);
@@ -763,6 +764,13 @@ function jobCard(j) {
   if (j.attempts_total > 1 && st !== "paused") parts.push(`attempt ${j.attempt}/${j.attempts_total}`);
   const w = Math.max(0, Math.min(100, j.percent || 0));
   const icon = JOB_KIND_ICON[j.kind] || JOB_KIND_ICON.file;
+  const filePick = j.kind === "torrent" && Array.isArray(j.files) && j.files.length > 1 ? `
+    <details class="job-files"><summary>${j.files.length} files</summary>
+      <div class="jf-list">${j.files.map((f) => {
+        const pct = f.length ? Math.min(100, ((f.have || 0) / f.length) * 100) : 100;
+        return `<div class="jf-row"><span class="jf-name" title="${escapeAttr(f.path)}">${escapeHtml(f.path)}</span><span class="jf-size">${fmtBytes(f.have || 0)} / ${fmtBytes(f.length)}</span><span class="jf-bar"><i style="width:${pct}%"></i></span></div>`;
+      }).join("")}</div>
+    </details>` : "";
   return `
   <div class="job ${cls} ${st}">
     <div class="job-ico">${icon}</div>
@@ -770,6 +778,7 @@ function jobCard(j) {
       <div class="job-title" title="${escapeAttr(j.filename || j.title || j.url)}">${escapeHtml(j.filename || j.title || j.url)}</div>
       <div class="job-sub"><span class="job-status">${escapeHtml(st)}</span>${pct ? `<span>${pct}</span>` : ""}${parts.length ? `<span>${parts.join(" · ")}</span>` : ""}</div>
       <div class="bar"><i style="width:${w}%"></i></div>
+      ${filePick}
       ${st === "error" && j.error ? `<div class="err">${escapeHtml(j.error)}</div>` : ""}
       ${j.hint ? `<div class="hint">💡 ${escapeHtml(j.hint)}</div>` : ""}
     </div>
@@ -779,8 +788,8 @@ function jobCard(j) {
       ${st === "paused" ? `<button class="icon-btn" data-resume="${j.id}" title="Resume" aria-label="Resume"><svg><use href="#i-play"/></svg></button>` : ""}
       ${st === "error" || st === "canceled" ? `<button class="icon-btn" data-retry="${j.id}" title="Retry (resumes partial file)" aria-label="Retry"><svg><use href="#i-retry"/></svg></button>` : ""}
       ${st === "running" || st === "queued" || st === "paused" ? `<button class="icon-btn danger" data-cancel="${j.id}" title="Stop" aria-label="Stop"><svg><use href="#i-close"/></svg></button>` : ""}
-      ${st === "done" && j.path ? `<button class="icon-btn" data-play="${escapeAttr(j.path)}" title="Play / open" aria-label="Open"><svg><use href="#i-play"/></svg></button>
-        <button class="icon-btn" data-show="${escapeAttr(j.path)}" title="Show in folder" aria-label="Show in folder"><svg><use href="#i-folder"/></svg></button>` : ""}
+      ${st === "done" && j.path && j.kind !== "torrent" ? `<button class="icon-btn" data-play="${escapeAttr(j.path)}" title="Play / open" aria-label="Open"><svg><use href="#i-play"/></svg></button>` : ""}
+      ${st === "done" && j.path ? `<button class="icon-btn" data-show="${escapeAttr(j.path)}" title="${j.kind === "torrent" ? "Open containing folder" : "Show in folder"}" aria-label="Show in folder"><svg><use href="#i-folder"/></svg></button>` : ""}
     </div>
   </div>`;
 }
@@ -842,6 +851,9 @@ async function fillSettings() {
   $("#sClip").checked = !!config.watch_clipboard;
   if ($("#sConn")) $("#sConn").value = String(config.connections || 8);
   if ($("#sLimit")) $("#sLimit").value = String(config.speed_limit_kbps || 0);
+  if ($("#sTorrentDown")) $("#sTorrentDown").value = String(config.torrent_download_kbps || 0);
+  if ($("#sTorrentUp")) $("#sTorrentUp").value = String(config.torrent_upload_kbps || 0);
+  if ($("#sTorrentSeed")) $("#sTorrentSeed").checked = !!config.torrent_seed_when_done;
   if ($("#sTurbo")) $("#sTurbo").checked = config.turbo !== false;
   if (driver.pickFolder) $("#sBrowse").classList.remove("hidden");
   let h = null;
@@ -867,6 +879,9 @@ async function saveSettings() {
       watch_clipboard: $("#sClip").checked,
       connections: Math.max(1, Math.min(16, parseInt(($("#sConn") || {}).value || "8", 10) || 8)),
       speed_limit_kbps: Math.max(0, parseInt(($("#sLimit") || {}).value || "0", 10) || 0),
+      torrent_download_kbps: Math.max(0, parseInt(($("#sTorrentDown") || {}).value || "0", 10) || 0),
+      torrent_upload_kbps: Math.max(0, parseInt(($("#sTorrentUp") || {}).value || "0", 10) || 0),
+      torrent_seed_when_done: !!($("#sTorrentSeed") || {}).checked,
       turbo: $("#sTurbo") ? $("#sTurbo").checked : true,
     });
     $("#sDir").value = config.download_dir || $("#sDir").value;
@@ -1066,6 +1081,8 @@ document.addEventListener("DOMContentLoaded", () => {
   on($("#tFiles"), "change", (e) => { if (e.target.matches('input[type="checkbox"]')) updateTorrentSelection(); });
   if (driver.torrentAddFile) {
     $("#torrentBtn").classList.remove("hidden");
+    const tc = $("#sTorrentCard");
+    if (tc) tc.classList.remove("hidden");
     on($("#torrentBtn"), "click", () => $("#torrentFile").click());
     on($("#torrentFile"), "change", (e) => {
       const f = e.target.files && e.target.files[0];
@@ -1135,6 +1152,7 @@ document.addEventListener("DOMContentLoaded", () => {
     on(b, "click", () => closeDlg(b.dataset.close)));
   window.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
+    if ($("#torrentSheet") && !$("#torrentSheet").classList.contains("hidden")) discardTorrentPick();
     document.querySelectorAll(".scrim").forEach((s) => s.classList.add("hidden"));
   });
 

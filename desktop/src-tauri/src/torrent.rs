@@ -24,6 +24,7 @@ use librqbit::{
 type TorrentId = usize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -55,6 +56,9 @@ pub struct TorrentManager {
     cancelled: Mutex<HashSet<TorrentId>>,
     /// First-seen timestamps for job rows; restored torrents get "now".
     seen: Mutex<HashMap<TorrentId, f64>>,
+    /// (download, upload) caps in KB/s; 0 = unlimited. Applies at session
+    /// creation, and live via `set_rate_limits`.
+    pending_limits: Mutex<(u64, u64)>,
 }
 
 impl TorrentManager {
@@ -63,6 +67,7 @@ impl TorrentManager {
             session: tokio::sync::OnceCell::new(),
             cancelled: Mutex::new(HashSet::new()),
             seen: Mutex::new(HashMap::new()),
+            pending_limits: Mutex::new((0, 0)),
         }
     }
 
@@ -83,8 +88,10 @@ impl TorrentManager {
                 let output = dirs::home_dir()
                     .map(|h| h.join("Downloads").join("GrabBox"))
                     .unwrap_or_else(|| PathBuf::from("."));
+                let (down_kbps, up_kbps) = *self.pending_limits.lock().unwrap();
                 let opts = SessionOptions {
                     fastresume: true,
+                    ratelimits: Self::limits_config(down_kbps, up_kbps),
                     persistence: Some(SessionPersistenceConfig::Json {
                         folder: Some(dir),
                     }),
@@ -115,6 +122,53 @@ impl TorrentManager {
             }
             hit
         })
+    }
+
+    fn to_nz(kbps: u64) -> Option<NonZeroU32> {
+        NonZeroU32::new((kbps.saturating_mul(1024)).min(u32::MAX as u64) as u32)
+    }
+
+    fn limits_config(down_kbps: u64, up_kbps: u64) -> librqbit::limits::LimitsConfig {
+        librqbit::limits::LimitsConfig {
+            upload_bps: Self::to_nz(up_kbps),
+            download_bps: Self::to_nz(down_kbps),
+        }
+    }
+
+    /// Set the global torrent caps (0 = unlimited). Applies to a session
+    /// created later, and live to a running one.
+    pub fn set_rate_limits(&self, down_kbps: u64, up_kbps: u64) {
+        *self.pending_limits.lock().unwrap() = (down_kbps, up_kbps);
+        if let Some(session) = self.session.get() {
+            session.ratelimits.set_download_bps(Self::to_nz(down_kbps));
+            session.ratelimits.set_upload_bps(Self::to_nz(up_kbps));
+        }
+    }
+
+    /// Park finished torrents so they stop uploading when the user hasn't
+    /// opted into seeding. Safe to call on every poll: already-paused
+    /// torrents just error and are skipped.
+    pub async fn stop_completed_seeding(&self, seed_when_done: bool) {
+        if seed_when_done {
+            return;
+        }
+        let Some(session) = self.session.get() else {
+            return;
+        };
+        let seeding: Vec<Arc<ManagedTorrent>> = session.with_torrents(|it| {
+            it.filter_map(|(_, handle)| {
+                let stats = handle.stats();
+                if stats.finished && !matches!(stats.state, TorrentStatsState::Paused) {
+                    Some(handle.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+        });
+        for handle in seeding {
+            let _ = session.pause(&handle).await;
+        }
     }
 
     /// Create the session if the user has persisted torrent state (fastresume
@@ -356,20 +410,37 @@ impl TorrentManager {
         session.with_torrents(|it| {
             it.map(|(id, handle)| {
                 let stats = handle.stats();
-                let name = handle
-                    .name()
-                    .unwrap_or_else(|| format!("torrent {id}"));
+                let (name, file_meta) = handle
+                    .with_metadata(|m| {
+                        let name = m
+                            .info
+                            .name()
+                            .map(|c| c.into_owned())
+                            .unwrap_or_else(|| format!("torrent {id}"));
+                        let files: Vec<(String, u64)> = m
+                            .info
+                            .iter_file_details()
+                            .map(|fd| {
+                                (
+                                    fd.filename.to_pathbuf().to_string_lossy().into_owned(),
+                                    fd.len,
+                                )
+                            })
+                            .collect();
+                        (name, files)
+                    })
+                    .unwrap_or_else(|_| (format!("torrent {id}"), Vec::new()));
                 let total = stats.total_bytes;
                 let percent = if total > 0 {
                     (stats.progress_bytes as f64 / total as f64 * 100.0).min(100.0)
                 } else {
                     0.0
                 };
-                let speed = stats
+                let (speed, upload_speed) = stats
                     .live
                     .as_ref()
-                    .map(|l| l.download_speed.as_bytes())
-                    .unwrap_or(0);
+                    .map(|l| (l.download_speed.as_bytes(), l.upload_speed.as_bytes()))
+                    .unwrap_or((0, 0));
                 let eta = if speed > 0 && total > stats.progress_bytes {
                     Some((total - stats.progress_bytes) / speed)
                 } else {
@@ -395,6 +466,7 @@ impl TorrentManager {
                     "status": status,
                     "percent": percent,
                     "speed": speed,
+                    "upload_speed": upload_speed,
                     "filename": name,
                     "path": handle.output_folder().to_string_lossy(),
                     "error": stats.error,
@@ -411,6 +483,20 @@ impl TorrentManager {
                 });
                 if let Some(secs) = eta {
                     job["eta"] = json!(secs);
+                }
+                if file_meta.len() > 1 {
+                    job["files"] = file_meta
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (path, len))| {
+                            json!({
+                                "path": path,
+                                "length": len,
+                                "have": stats.file_progress.get(i).copied().unwrap_or(0),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into();
                 }
                 job
             })

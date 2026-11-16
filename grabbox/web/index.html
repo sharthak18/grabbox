@@ -300,6 +300,36 @@
           <p class="card-note">Work-stealing segments, expired-link refresh, self-healing sockets. Falls back to the yt-dlp engine automatically when a site needs it.</p>
         </section>
 
+        <!-- torrents card (desktop only; revealed by app.js on Tauri) -->
+        <section class="card hidden" id="sTorrentCard">
+          <h3 class="card-title"><svg class="mini"><use href="#i-magnet"/></svg>Torrents</h3>
+          <div class="two-col">
+            <label class="field"><span>Download speed limit</span>
+              <select id="sTorrentDown">
+                <option value="0">Unlimited</option>
+                <option value="512">512 KB/s</option>
+                <option value="1024">1 MB/s</option>
+                <option value="5120">5 MB/s</option>
+                <option value="10240">10 MB/s</option>
+                <option value="51200">50 MB/s</option>
+              </select>
+            </label>
+            <label class="field"><span>Upload speed limit</span>
+              <select id="sTorrentUp">
+                <option value="0">Unlimited</option>
+                <option value="512">512 KB/s</option>
+                <option value="1024">1 MB/s</option>
+                <option value="5120">5 MB/s</option>
+                <option value="10240">10 MB/s</option>
+                <option value="51200">50 MB/s</option>
+              </select>
+            </label>
+          </div>
+          <label class="check-row switch-row"><span>Keep seeding after a torrent finishes</span>
+            <input id="sTorrentSeed" type="checkbox" class="switch"></label>
+          <p class="card-note">Finished torrents stop seeding unless you opt in — files stay fully intact; nothing is removed. Limits apply to all torrents at once.</p>
+        </section>
+
         <!-- appearance card -->
         <section class="card">
           <h3 class="card-title">Appearance</h3>

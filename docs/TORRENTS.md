@@ -18,6 +18,15 @@ Paste a `magnet:` link into the grab bar — or hit the paperclip button and pic
   (librqbit JSON persistence + fastresume). On next launch GrabBox restores the
   session automatically, but **only if that folder exists** — users who never
   touch torrents pay zero cost (no bound ports, no DHT).
+- **Speed caps** in *Settings → Torrents* — global download/upload limits,
+  applied live (no restart) and at session creation.
+- **Seeding is opt-in** — finished torrents stop uploading unless *Keep
+  seeding after a torrent finishes* is on (Settings → Torrents). Files stay
+  intact either way; nothing is removed. (Per-torrent seed control is a
+  follow-up; the cap and the opt-in are global.)
+- **Per-file progress** — expand the "N files" disclosure inside a multi-file
+  torrent's card to see each file's size and bytes done.
+- **Escape** closes the file picker and deletes the paused inspection torrent.
 - Downloads land in your configured folder (multi-file torrents get their
   usual per-torrent subfolder).
 - **Clear finished** removes completed / canceled torrent rows from the list.
@@ -31,9 +40,10 @@ Paste a `magnet:` link into the grab bar — or hit the paperclip button and pic
   hides the paperclip and says plainly that torrents need the desktop app
   instead of failing silently. A future Android path would bind librqbit over
   FFI, or implement the protocol natively in Kotlin.
-- **Sequential-download preference**, bandwidth caps per torrent, and a
-  piece-level progress view. The engine supports all of these (`ratelimits`,
-  piece stats); they are follow-ups.
+- **Per-torrent bandwidth caps** (limits are session-global), **per-torrent
+  seed/ratio control**, and **RSS auto-download** (a separate milestone,
+  deliberately not bundled here). rqbit streams sequentially by default, so
+  there is no "sequential mode" toggle to add.
 - **RSS auto-download of torrents**, debrid-service unlocking. Planned as a
   separate milestone; the queue hooks are already in place.
 - **Seeding control / ratio limits** — GrabBox keeps finished torrents paused
@@ -69,6 +79,9 @@ grabbox_cancel / pause / resume ──► parse_torrent_id()? bt-… → session
 ```
 
 Job rows carry the same fields as yt-dlp jobs (`kind: "torrent"`,
-`status: running|done|paused|queued|canceled|error`), so the queue UI,
+`status: running|done|paused|queued|canceled|error`, plus `upload_speed` and
+`files: [{path, length, have}]` for multi-file torrents), so the queue UI,
 filter tabs, sidebar badges and notifications work unchanged. "Canceled" maps
 to *paused in the engine + a tombstone in GrabBox*; **Retry** resumes it.
+Finished torrents keep `status: "done"` even after the seed-stop sweep parks
+them (the engine's `finished` flag wins over its paused state).

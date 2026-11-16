@@ -90,6 +90,13 @@ async fn grabbox_download(
 
 #[tauri::command]
 fn grabbox_jobs(state: tauri::State<'_, AppState>) -> Result<Value, String> {
+    // Park finished torrents when the user hasn't opted into seeding. Fire
+    // and forget; rows still report them as done (stats.finished wins).
+    let seed_when_done = state.config.get_bool("torrent_seed_when_done");
+    let mgr = state.torrents.clone();
+    tauri::async_runtime::spawn(async move {
+        mgr.stop_completed_seeding(seed_when_done).await;
+    });
     let mut rows: Vec<Value> = state.manager.list().into_iter().map(|j| json!(j)).collect();
     rows.extend(state.torrents.snapshot());
     Ok(json!(rows))
@@ -285,6 +292,10 @@ fn grabbox_get_config(state: tauri::State<'_, AppState>) -> Result<Value, String
 #[tauri::command]
 fn grabbox_set_config(state: tauri::State<'_, AppState>, config: Value) -> Result<Value, String> {
     state.config.update(&config)?;
+    // Torrent caps apply live to the running session (and at creation).
+    let down = state.config.get_i64("torrent_download_kbps", 0).max(0) as u64;
+    let up = state.config.get_i64("torrent_upload_kbps", 0).max(0) as u64;
+    state.torrents.set_rate_limits(down, up);
     Ok(state.config.to_json())
 }
 
