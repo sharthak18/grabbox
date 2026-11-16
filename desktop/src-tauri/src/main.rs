@@ -11,6 +11,7 @@ mod engine;
 mod fsys;
 mod horse;
 mod jobs;
+mod torrent;
 
 use config::Config;
 use engine::Engine;
@@ -23,6 +24,7 @@ pub struct AppState {
     engine: Engine,
     config: Arc<Config>,
     manager: Manager,
+    torrents: Arc<torrent::TorrentManager>,
     app: tauri::AppHandle,
     /// A URL handed to a *second* instance (`grabbox <url>` or the extension),
     /// waiting for the window to pick it up.
@@ -88,16 +90,39 @@ async fn grabbox_download(
 
 #[tauri::command]
 fn grabbox_jobs(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    Ok(json!(state.manager.list()))
+    // Park finished torrents when the user hasn't opted into seeding. Fire
+    // and forget; rows still report them as done (stats.finished wins).
+    let seed_when_done = state.config.get_bool("torrent_seed_when_done");
+    let mgr = state.torrents.clone();
+    tauri::async_runtime::spawn(async move {
+        mgr.stop_completed_seeding(seed_when_done).await;
+    });
+    let mut rows: Vec<Value> = state.manager.list().into_iter().map(|j| json!(j)).collect();
+    rows.extend(state.torrents.snapshot());
+    Ok(json!(rows))
 }
 
 #[tauri::command]
-fn grabbox_cancel(state: tauri::State<'_, AppState>, id: String) -> Result<Value, String> {
+async fn grabbox_cancel(state: tauri::State<'_, AppState>, id: String) -> Result<Value, String> {
+    if let Some(tid) = torrent::parse_torrent_id(&id) {
+        let mgr = state.torrents.clone();
+        return match mgr.pause(tid).await {
+            Ok(_) => Ok(json!({ "ok": true })),
+            Err(e) => Err(e),
+        };
+    }
     Ok(json!({ "ok": state.manager.cancel(&id) }))
 }
 
 #[tauri::command]
-fn grabbox_pause(state: tauri::State<'_, AppState>, id: String) -> Result<Value, String> {
+async fn grabbox_pause(state: tauri::State<'_, AppState>, id: String) -> Result<Value, String> {
+    if let Some(tid) = torrent::parse_torrent_id(&id) {
+        let mgr = state.torrents.clone();
+        return match mgr.pause(tid).await {
+            Ok(_) => Ok(json!({ "ok": true })),
+            Err(e) => Err(e),
+        };
+    }
     Ok(json!({ "ok": state.manager.pause(&id) }))
 }
 
@@ -106,6 +131,13 @@ async fn grabbox_resume(
     state: tauri::State<'_, AppState>,
     id: String,
 ) -> Result<Value, String> {
+    if let Some(tid) = torrent::parse_torrent_id(&id) {
+        let mgr = state.torrents.clone();
+        return match mgr.unpause(tid).await {
+            Ok(_) => Ok(json!({ "ok": true })),
+            Err(e) => Err(e),
+        };
+    }
     let engine = state.engine.clone();
     let cfg = state.config.clone();
     let manager = state.manager.clone();
@@ -151,8 +183,76 @@ async fn grabbox_download_batch(
 }
 
 #[tauri::command]
-fn grabbox_clear_jobs(state: tauri::State<'_, AppState>) -> Result<Value, String> {
+async fn grabbox_torrent_add(
+    state: tauri::State<'_, AppState>,
+    magnet: String,
+) -> Result<Value, String> {
+    let dir = state.config.download_dir();
+    state.torrents.add_magnet(&magnet, &dir).await
+}
+
+#[tauri::command]
+async fn grabbox_torrent_add_file(
+    state: tauri::State<'_, AppState>,
+    data_b64: String,
+) -> Result<Value, String> {
+    let dir = state.config.download_dir();
+    state.torrents.add_torrent_file(&data_b64, &dir).await
+}
+
+#[tauri::command]
+async fn grabbox_torrent_inspect(
+    state: tauri::State<'_, AppState>,
+    magnet: String,
+) -> Result<Value, String> {
+    let dir = state.config.download_dir();
+    // Magnet metadata can take a while to arrive from peers — cap the wait.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        state.torrents.inspect_magnet(&magnet, &dir),
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(_) => Err("couldn't fetch the torrent's metadata in 90s — check the link".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn grabbox_torrent_inspect_file(
+    state: tauri::State<'_, AppState>,
+    data_b64: String,
+) -> Result<Value, String> {
+    let dir = state.config.download_dir();
+    state.torrents.inspect_torrent_file(&data_b64, &dir).await
+}
+
+#[tauri::command]
+async fn grabbox_torrent_select(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    files: Vec<usize>,
+) -> Result<Value, String> {
+    let id = torrent::parse_torrent_id(&id).ok_or_else(|| "not a torrent job".to_string())?;
+    state.torrents.select(id, files).await?;
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command]
+async fn grabbox_torrent_discard(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<Value, String> {
+    if let Some(id) = torrent::parse_torrent_id(&id) {
+        state.torrents.discard(id).await?;
+    }
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command]
+async fn grabbox_clear_jobs(state: tauri::State<'_, AppState>) -> Result<Value, String> {
     state.manager.clear_finished();
+    state.torrents.clear_finished().await;
     Ok(json!({ "ok": true }))
 }
 
@@ -192,6 +292,10 @@ fn grabbox_get_config(state: tauri::State<'_, AppState>) -> Result<Value, String
 #[tauri::command]
 fn grabbox_set_config(state: tauri::State<'_, AppState>, config: Value) -> Result<Value, String> {
     state.config.update(&config)?;
+    // Torrent caps apply live to the running session (and at creation).
+    let down = state.config.get_i64("torrent_download_kbps", 0).max(0) as u64;
+    let up = state.config.get_i64("torrent_upload_kbps", 0).max(0) as u64;
+    state.torrents.set_rate_limits(down, up);
     Ok(state.config.to_json())
 }
 
@@ -327,6 +431,15 @@ pub fn run() {
                 config.get_i64("concurrency", 2).max(1) as usize,
                 Some(app.handle().clone()),
             );
+            let torrents = Arc::new(torrent::TorrentManager::new());
+            // Warm-restore previously persisted torrents, but only for users
+            // who actually have torrent state on disk.
+            if torrent::TorrentManager::has_persisted_state() {
+                let warm = torrents.clone();
+                tauri::async_runtime::spawn(async move {
+                    warm.ensure_session().await;
+                });
+            }
             let pending_url = Arc::new(Mutex::new(
                 std::env::args().find_map(|a| engine::first_url_arg(&a)),
             ));
@@ -334,6 +447,7 @@ pub fn run() {
                 engine,
                 config,
                 manager,
+                torrents,
                 app: app.handle().clone(),
                 pending_url,
             });
@@ -371,6 +485,12 @@ pub fn run() {
             grabbox_pick_folder,
             grabbox_open_extension_folder,
             grabbox_take_pending_url,
+            grabbox_torrent_add,
+            grabbox_torrent_add_file,
+            grabbox_torrent_inspect,
+            grabbox_torrent_inspect_file,
+            grabbox_torrent_select,
+            grabbox_torrent_discard,
         ])
         .run(tauri::generate_context!())
         .expect("error while running GrabBox");

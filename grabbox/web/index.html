@@ -64,6 +64,8 @@
   <symbol id="i-retry" viewBox="0 0 24 24"><path d="M17.65 6.35A8 8 0 1 0 19.73 14h-2.08a6 6 0 1 1-1.41-6.24L13 11h7V4l-2.35 2.35z" fill="currentColor"/></symbol>
   <symbol id="i-chat" viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-1.99.9-1.99 2L2 22l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM9 11H7V9h2v2zm4 0h-2V9h2v2zm4 0h-2V9h2v2z" fill="currentColor"/></symbol>
   <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M11 21h-1l1-7H7.5c-.58 0-.57-.32-.38-.66l.07-.12C8.48 10.94 10.42 7.54 13 3h1l-1 7h3.5c.49 0 .56.33.37.66l-.07.15C14.96 15.26 12 18.62 11 21z" fill="currentColor"/></symbol>
+  <symbol id="i-magnet" viewBox="0 0 24 24"><path d="M4 3h6v9a2 2 0 0 0 4 0V3h6v9a8 8 0 0 1-16 0V3z" fill="currentColor"/><path d="M4 3h6v4H4zM14 3h6v4h-6z" fill="currentColor" opacity=".55"/></symbol>
+  <symbol id="i-attach" viewBox="0 0 24 24"><path d="M16.5 6v11.5a4 4 0 0 1-8 0V5a2.5 2.5 0 0 1 5 0v10.5a1 1 0 0 1-2 0V6H10v9.5a2.5 2.5 0 0 0 5 0V5a4 4 0 0 0-8 0v12.5a5.5 5.5 0 0 0 11 0V6h-1.5z" fill="currentColor"/></symbol>
 </svg>
 
 <div id="app">
@@ -118,6 +120,10 @@
       <svg class="add-lead"><use href="#i-link"/></svg>
       <input id="url" type="url" placeholder="Paste a link to grab — video, audio, ISO, anything"
              autocomplete="off" spellcheck="false" enterkeyhint="go" aria-label="Link to download">
+      <button id="torrentBtn" class="icon-btn big hidden" title="Add a .torrent file" aria-label="Add a .torrent file">
+        <svg><use href="#i-attach"/></svg>
+      </button>
+      <input type="file" id="torrentFile" accept=".torrent,application/x-bittorrent" class="hidden" aria-hidden="true">
       <button id="go" class="filled-btn grab-btn">
         <svg class="mini"><use href="#i-download"/></svg><span>Grab</span>
       </button>
@@ -197,6 +203,30 @@
         </div>
       </section>
 
+      <!-- torrent file picker (desktop only) -->
+      <section id="torrentSheet" class="sheet hidden" aria-live="polite">
+        <button id="tClose" class="icon-btn sheet-close" title="Cancel" aria-label="Cancel"><svg><use href="#i-close"/></svg></button>
+        <div class="sheet-head">
+          <div class="thumb-wrap"><svg class="thumb-ph t-magnet"><use href="#i-magnet"/></svg></div>
+          <div class="sheet-meta">
+            <span id="tBadge" class="badge">Torrent</span>
+            <h2 id="tTitle">Reading torrent…</h2>
+            <p id="tSub" class="meta-line">Fetching metadata — magnets on quiet swarms can take a moment.</p>
+          </div>
+        </div>
+        <div id="tTools" class="t-tools hidden">
+          <label class="check-row t-all"><input id="tAll" type="checkbox" checked><span>Select all</span></label>
+          <span id="tTotal" class="size-hint"></span>
+        </div>
+        <div id="tFiles" class="t-files hidden"></div>
+        <div id="tActions" class="sheet-actions hidden">
+          <span id="tSel" class="size-hint"></span>
+          <button id="tDownload" class="filled-btn big">
+            <svg class="mini"><use href="#i-download"/></svg><span>Download</span>
+          </button>
+        </div>
+      </section>
+
       <div id="jobs" class="job-list"></div>
     </div>
 
@@ -270,6 +300,36 @@
           <p class="card-note">Work-stealing segments, expired-link refresh, self-healing sockets. Falls back to the yt-dlp engine automatically when a site needs it.</p>
         </section>
 
+        <!-- torrents card (desktop only; revealed by app.js on Tauri) -->
+        <section class="card hidden" id="sTorrentCard">
+          <h3 class="card-title"><svg class="mini"><use href="#i-magnet"/></svg>Torrents</h3>
+          <div class="two-col">
+            <label class="field"><span>Download speed limit</span>
+              <select id="sTorrentDown">
+                <option value="0">Unlimited</option>
+                <option value="512">512 KB/s</option>
+                <option value="1024">1 MB/s</option>
+                <option value="5120">5 MB/s</option>
+                <option value="10240">10 MB/s</option>
+                <option value="51200">50 MB/s</option>
+              </select>
+            </label>
+            <label class="field"><span>Upload speed limit</span>
+              <select id="sTorrentUp">
+                <option value="0">Unlimited</option>
+                <option value="512">512 KB/s</option>
+                <option value="1024">1 MB/s</option>
+                <option value="5120">5 MB/s</option>
+                <option value="10240">10 MB/s</option>
+                <option value="51200">50 MB/s</option>
+              </select>
+            </label>
+          </div>
+          <label class="check-row switch-row"><span>Keep seeding after a torrent finishes</span>
+            <input id="sTorrentSeed" type="checkbox" class="switch"></label>
+          <p class="card-note">Finished torrents stop seeding unless you opt in — files stay fully intact; nothing is removed. Limits apply to all torrents at once.</p>
+        </section>
+
         <!-- appearance card -->
         <section class="card">
           <h3 class="card-title">Appearance</h3>
@@ -327,7 +387,7 @@
 <div id="dropOverlay" class="drop-overlay hidden">
   <div class="drop-card">
     <svg class="big-ico"><use href="#i-download"/></svg>
-    <p>Drop the link to grab it</p>
+    <p>Drop a link — or a .torrent file</p>
   </div>
 </div>
 

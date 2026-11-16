@@ -151,5 +151,9 @@ fn default_map() -> Map<String, Value> {
     m.insert("watch_clipboard".into(), json!(false));
     m.insert("port".into(), json!(8765));
     m.insert("open_browser".into(), json!(true));
+    // Torrents (desktop only; the Python side ignores these keys).
+    m.insert("torrent_download_kbps".into(), json!(0));  // 0 = unlimited
+    m.insert("torrent_upload_kbps".into(), json!(0));    // 0 = unlimited
+    m.insert("torrent_seed_when_done".into(), json!(false));
     m
 }

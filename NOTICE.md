@@ -37,3 +37,15 @@ is original, written from scratch against GrabBox's own driver layer:
   speed-first status presentation.
 
 Thank you to their authors for proving what a good download UI feels like.
+
+## Torrent support — librqbit (Apache-2.0)
+
+- Project: https://github.com/ikatson/rqbit (crate `librqbit`)
+- License: Apache-2.0, Copyright (c) 2021 Igor Katson
+- What we use: the `librqbit` library as the BitTorrent engine inside the
+  desktop app (`desktop/src-tauri/src/torrent.rs`) — session persistence,
+  DHT, fastresume, incoming peers on an ephemeral TCP port. GrabBox drives it
+  through its public API; the engine, its design (and rqbit's) are credited
+  here per the license. Our glue code and UI are our own.
+- Mister Download Manager (GPL-3.0) was studied for feature scope only; no
+  code from it appears in GrabBox.

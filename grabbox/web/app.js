@@ -11,6 +11,141 @@
 const $ = (sel) => document.querySelector(sel);
 const on = (el, ev, fn) => el.addEventListener(ev, fn);
 
+function isMagnet(url) {
+  return /^\s*magnet:/i.test(url || "");
+}
+
+/** Hand a magnet link to the desktop torrent engine (or explain why not).
+    Used by batch paste — the single "Grab" path goes through the picker. */
+async function addTorrent(magnet) {
+  magnet = (magnet || "").trim();
+  if (!magnet) return false;
+  if (!driver.torrentAdd) {
+    toast("Torrents need the desktop app — the browser build can't open magnet links yet");
+    return false;
+  }
+  try {
+    await driver.torrentAdd(magnet);
+    toast("🧲 Torrent added");
+  } catch (e) {
+    toast("Torrent rejected: " + String(e));
+    return false;
+  }
+  refreshJobs(true);
+  return true;
+}
+
+function addTorrentFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    const b64 = String(reader.result || "").split(",", 2)[1] || "";
+    if (!b64) return toast("Could not read that file");
+    inspectTorrent("file", b64);
+  };
+  reader.readAsDataURL(file);
+}
+
+/* -------------------------------------------- torrent file picker sheet -- */
+
+let torrentPick = null; // { id, files: [{ index, path, length }] }
+
+function hideTorrentSheet() {
+  $("#torrentSheet").classList.add("hidden");
+  torrentPick = null;
+}
+
+function showTorrentLoading() {
+  $("#result").classList.add("hidden");
+  $("#tTitle").textContent = "Reading torrent…";
+  $("#tSub").textContent = "Fetching metadata — magnets on quiet swarms can take a moment.";
+  $("#tFiles").innerHTML = "";
+  $("#tFiles").classList.add("hidden");
+  $("#tTools").classList.add("hidden");
+  $("#tActions").classList.add("hidden");
+  $("#torrentSheet").classList.remove("hidden");
+  $("#torrentSheet").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+async function inspectTorrent(kind, payload) {
+  if (!driver.torrentInspect) {
+    return toast("Torrents need the desktop app — the browser build can't open them yet");
+  }
+  go("downloads");
+  showTorrentLoading();
+  try {
+    const res = kind === "magnet"
+      ? await driver.torrentInspect(payload)
+      : await driver.torrentInspectFile(payload);
+    renderTorrentPick(res);
+  } catch (e) {
+    hideTorrentSheet();
+    toast("Torrent rejected: " + String(e));
+  }
+}
+
+function renderTorrentPick(res) {
+  const files = Array.isArray(res.files) ? res.files : [];
+  if (!files.length) return hideTorrentSheet(), toast("That torrent looks empty");
+  torrentPick = { id: res.id, files };
+  $("#tTitle").textContent = res.name || "Torrent";
+  $("#tSub").textContent = `${files.length} file${files.length === 1 ? "" : "s"} in this torrent — pick what you want`;
+  $("#tTotal").textContent = fmtBytes(res.total_size || files.reduce((a, f) => a + (f.length || 0), 0));
+  $("#tFiles").innerHTML = files.map((f) => `
+    <label class="t-file">
+      <input type="checkbox" data-idx="${f.index}" checked>
+      <span class="t-name" title="${escapeAttr(f.path)}">${escapeHtml(f.path)}</span>
+      <span class="t-size">${fmtBytes(f.length)}</span>
+    </label>`).join("");
+  $("#tFiles").classList.remove("hidden");
+  $("#tTools").classList.remove("hidden");
+  $("#tActions").classList.remove("hidden");
+  updateTorrentSelection();
+}
+
+function selectedTorrentIndices() {
+  return [...document.querySelectorAll('#tFiles input[type="checkbox"]:checked')]
+    .map((el) => Number(el.dataset.idx));
+}
+
+function updateTorrentSelection() {
+  if (!torrentPick) return;
+  const picked = new Set(selectedTorrentIndices());
+  const bytes = torrentPick.files.reduce((acc, f) => picked.has(f.index) ? acc + (f.length || 0) : acc, 0);
+  $("#tSel").textContent = picked.size
+    ? `${picked.size} of ${torrentPick.files.length} · ${fmtBytes(bytes)}`
+    : "Nothing selected";
+  $("#tDownload").disabled = picked.size === 0;
+  const all = $("#tAll");
+  if (all) all.checked = picked.size === torrentPick.files.length;
+}
+
+async function confirmTorrentDownload() {
+  if (!torrentPick) return;
+  const sel = selectedTorrentIndices();
+  if (!sel.length) return toast("Pick at least one file");
+  const { id, files } = torrentPick;
+  const btn = $("#tDownload");
+  btn.disabled = true;
+  try {
+    // [] tells the engine "everything" and skips a redundant rewrite.
+    await driver.torrentSelect(id, sel.length === files.length ? [] : sel);
+    hideTorrentSheet();
+    toast("🧲 Torrent added to the queue");
+    refreshJobs(true);
+  } catch (e) {
+    toast("Couldn't start the torrent: " + String(e));
+    btn.disabled = false;
+  }
+}
+
+async function discardTorrentPick() {
+  const id = torrentPick && torrentPick.id;
+  hideTorrentSheet();
+  if (id && driver.torrentDiscard) {
+    try { await driver.torrentDiscard(id); } catch (e) { /* best effort */ }
+  }
+}
+
 /* ============================================================ router === */
 
 let jobFilter = "all";         // downloads view filter: all | active | done | failed
@@ -73,6 +208,12 @@ function httpDriver() {
     updateYtdlp: () => post("/api/update-ytdlp"),
     pickFolder: null,               // browsers cannot pick folders
     openExtensionFolder: null,
+    torrentAdd: null,               // torrents are desktop-only for now
+    torrentAddFile: null,
+    torrentInspect: null,
+    torrentInspectFile: null,
+    torrentSelect: null,
+    torrentDiscard: null,
   };
 }
 
@@ -98,6 +239,12 @@ function tauriDriver() {
     updateYtdlp: () => invoke("grabbox_update_ytdlp"),
     pickFolder: () => invoke("grabbox_pick_folder"),
     openExtensionFolder: () => invoke("grabbox_open_extension_folder"),
+    torrentAdd: (magnet) => invoke("grabbox_torrent_add", { magnet }),
+    torrentAddFile: (data_b64) => invoke("grabbox_torrent_add_file", { data_b64 }),
+    torrentInspect: (magnet) => invoke("grabbox_torrent_inspect", { magnet }),
+    torrentInspectFile: (data_b64) => invoke("grabbox_torrent_inspect_file", { data_b64 }),
+    torrentSelect: (id, files) => invoke("grabbox_torrent_select", { id, files }),
+    torrentDiscard: (id) => invoke("grabbox_torrent_discard", { id }),
     takePendingUrl: () => invoke("grabbox_take_pending_url"),
     onGrabUrl: (cb) => window.__TAURI__.event.listen("grab-url", (e) => cb(e.payload)),
   };
@@ -288,8 +435,14 @@ function setPill(text, cls) {
 async function analyze(url) {
   url = (url || "").trim();
   if (!url) return toast("Paste a link first");
+  if (isMagnet(url)) {
+    $("#url").value = "";
+    inspectTorrent("magnet", url);
+    return;
+  }
 
   go("downloads");
+  $("#torrentSheet").classList.add("hidden");
   $("#result").classList.remove("hidden");
   $("#result").scrollIntoView({ behavior: "smooth", block: "nearest" });
   $("#rBadge").textContent = "Analyzing";
@@ -454,20 +607,28 @@ function updateSizeHint() {
 
 /** Every http(s) URL in a blob of text (paste, drop, share sheet). */
 function extractUrls(text) {
-  const found = String(text || "").match(/https?:\/\/[^\s<>"']+/g) || [];
+  const found = String(text || "").match(/(magnet:\?[^\s<>"']+|https?:\/\/[^\s<>"']+)/g) || [];
   return [...new Set(found.map((u) => u.replace(/[)\].,;]+$/, "")))];
 }
 
 /** Queue many links at once with the defaults — no probing sheet per link. */
 async function quickQueue(urls) {
   maybeAskNotify();
-  try {
-    const res = await driver.downloadBatch(urls);
-    const n = (res.jobs || []).length || urls.length;
-    toast(`Queued ${n} download${n === 1 ? "" : "s"} 🐎`);
-  } catch (e) {
-    toast(String(e));
+  const magnets = urls.filter(isMagnet);
+  const links = urls.filter((u) => !isMagnet(u));
+  let queued = 0;
+  for (const m of magnets) {
+    if (await addTorrent(m)) queued += 1;
   }
+  if (links.length) {
+    try {
+      const res = await driver.downloadBatch(links);
+      queued += (res.jobs || []).length || links.length;
+    } catch (e) {
+      toast(String(e));
+    }
+  }
+  if (queued) toast(`Queued ${queued} download${queued === 1 ? "" : "s"} 🐎`);
   $("#url").value = "";
   refreshJobs(true);
 }
@@ -506,6 +667,7 @@ const notified = new Set();
 const JOB_KIND_ICON = {
   video: "🎬", audio: "🎵", image: "🖼️", app: "📦",
   archive: "🗜️", document: "📄", file: "⬇️", other: "⬇️",
+  torrent: "🧲",
 };
 
 async function refreshJobs(force) {
@@ -594,6 +756,7 @@ function jobCard(j) {
   const pct = j.percent ? `${Math.max(0, Math.min(100, j.percent)).toFixed(0)}%` : "";
   const parts = [];
   if (j.speed) parts.push(`${fmtBytes(j.speed)}/s`);
+  if (j.upload_speed) parts.push(`↑ ${fmtBytes(j.upload_speed)}/s`);
   if (j.eta) parts.push(`${Math.round(j.eta)}s left`);
   if (j.segments > 1 && (st === "running" || st === "paused")) parts.push(`⚡×${j.segments}`);
   if (j.size && j.downloaded) parts.push(`${fmtBytes(j.downloaded)} / ${fmtBytes(j.size)}`);
@@ -601,6 +764,13 @@ function jobCard(j) {
   if (j.attempts_total > 1 && st !== "paused") parts.push(`attempt ${j.attempt}/${j.attempts_total}`);
   const w = Math.max(0, Math.min(100, j.percent || 0));
   const icon = JOB_KIND_ICON[j.kind] || JOB_KIND_ICON.file;
+  const filePick = j.kind === "torrent" && Array.isArray(j.files) && j.files.length > 1 ? `
+    <details class="job-files"><summary>${j.files.length} files</summary>
+      <div class="jf-list">${j.files.map((f) => {
+        const pct = f.length ? Math.min(100, ((f.have || 0) / f.length) * 100) : 100;
+        return `<div class="jf-row"><span class="jf-name" title="${escapeAttr(f.path)}">${escapeHtml(f.path)}</span><span class="jf-size">${fmtBytes(f.have || 0)} / ${fmtBytes(f.length)}</span><span class="jf-bar"><i style="width:${pct}%"></i></span></div>`;
+      }).join("")}</div>
+    </details>` : "";
   return `
   <div class="job ${cls} ${st}">
     <div class="job-ico">${icon}</div>
@@ -608,6 +778,7 @@ function jobCard(j) {
       <div class="job-title" title="${escapeAttr(j.filename || j.title || j.url)}">${escapeHtml(j.filename || j.title || j.url)}</div>
       <div class="job-sub"><span class="job-status">${escapeHtml(st)}</span>${pct ? `<span>${pct}</span>` : ""}${parts.length ? `<span>${parts.join(" · ")}</span>` : ""}</div>
       <div class="bar"><i style="width:${w}%"></i></div>
+      ${filePick}
       ${st === "error" && j.error ? `<div class="err">${escapeHtml(j.error)}</div>` : ""}
       ${j.hint ? `<div class="hint">💡 ${escapeHtml(j.hint)}</div>` : ""}
     </div>
@@ -617,8 +788,8 @@ function jobCard(j) {
       ${st === "paused" ? `<button class="icon-btn" data-resume="${j.id}" title="Resume" aria-label="Resume"><svg><use href="#i-play"/></svg></button>` : ""}
       ${st === "error" || st === "canceled" ? `<button class="icon-btn" data-retry="${j.id}" title="Retry (resumes partial file)" aria-label="Retry"><svg><use href="#i-retry"/></svg></button>` : ""}
       ${st === "running" || st === "queued" || st === "paused" ? `<button class="icon-btn danger" data-cancel="${j.id}" title="Stop" aria-label="Stop"><svg><use href="#i-close"/></svg></button>` : ""}
-      ${st === "done" && j.path ? `<button class="icon-btn" data-play="${escapeAttr(j.path)}" title="Play / open" aria-label="Open"><svg><use href="#i-play"/></svg></button>
-        <button class="icon-btn" data-show="${escapeAttr(j.path)}" title="Show in folder" aria-label="Show in folder"><svg><use href="#i-folder"/></svg></button>` : ""}
+      ${st === "done" && j.path && j.kind !== "torrent" ? `<button class="icon-btn" data-play="${escapeAttr(j.path)}" title="Play / open" aria-label="Open"><svg><use href="#i-play"/></svg></button>` : ""}
+      ${st === "done" && j.path ? `<button class="icon-btn" data-show="${escapeAttr(j.path)}" title="${j.kind === "torrent" ? "Open containing folder" : "Show in folder"}" aria-label="Show in folder"><svg><use href="#i-folder"/></svg></button>` : ""}
     </div>
   </div>`;
 }
@@ -680,6 +851,9 @@ async function fillSettings() {
   $("#sClip").checked = !!config.watch_clipboard;
   if ($("#sConn")) $("#sConn").value = String(config.connections || 8);
   if ($("#sLimit")) $("#sLimit").value = String(config.speed_limit_kbps || 0);
+  if ($("#sTorrentDown")) $("#sTorrentDown").value = String(config.torrent_download_kbps || 0);
+  if ($("#sTorrentUp")) $("#sTorrentUp").value = String(config.torrent_upload_kbps || 0);
+  if ($("#sTorrentSeed")) $("#sTorrentSeed").checked = !!config.torrent_seed_when_done;
   if ($("#sTurbo")) $("#sTurbo").checked = config.turbo !== false;
   if (driver.pickFolder) $("#sBrowse").classList.remove("hidden");
   let h = null;
@@ -705,6 +879,9 @@ async function saveSettings() {
       watch_clipboard: $("#sClip").checked,
       connections: Math.max(1, Math.min(16, parseInt(($("#sConn") || {}).value || "8", 10) || 8)),
       speed_limit_kbps: Math.max(0, parseInt(($("#sLimit") || {}).value || "0", 10) || 0),
+      torrent_download_kbps: Math.max(0, parseInt(($("#sTorrentDown") || {}).value || "0", 10) || 0),
+      torrent_upload_kbps: Math.max(0, parseInt(($("#sTorrentUp") || {}).value || "0", 10) || 0),
+      torrent_seed_when_done: !!($("#sTorrentSeed") || {}).checked,
       turbo: $("#sTurbo") ? $("#sTurbo").checked : true,
     });
     $("#sDir").value = config.download_dir || $("#sDir").value;
@@ -847,8 +1024,11 @@ function toast(msg) {
 function setupDragDrop() {
   let depth = 0;
   const overlay = $("#dropOverlay");
+  const dragHasTorrent = (dt) =>
+    [...(dt ? dt.types : [])].some((t) => t.includes("file"));
   window.addEventListener("dragenter", (e) => {
-    if (![...(e.dataTransfer ? e.dataTransfer.types : [])].some((t) => t.includes("text"))) return;
+    const types = [...(e.dataTransfer ? e.dataTransfer.types : [])];
+    if (!types.some((t) => t.includes("text") || t.includes("file"))) return;
     depth++;
     overlay.classList.remove("hidden");
   });
@@ -861,6 +1041,11 @@ function setupDragDrop() {
     e.preventDefault();
     depth = 0;
     overlay.classList.add("hidden");
+    // A dropped .torrent file goes through the picker, not the link probe.
+    const torrentFile = [...(e.dataTransfer.files || [])].find(
+      (f) => /\.torrent$/i.test(f.name) || f.type === "application/x-bittorrent"
+    );
+    if (torrentFile) { addTorrentFile(torrentFile); return; }
     const text = e.dataTransfer.getData("text/uri-list") || e.dataTransfer.getData("text/plain") || "";
     const urls = extractUrls(text);
     if (urls.length > 1) {
@@ -887,6 +1072,24 @@ document.addEventListener("DOMContentLoaded", () => {
   setInterval(loadFiles, 5000);
   setInterval(pollClipboard, 1500);
 
+  on($("#tClose"), "click", discardTorrentPick);
+  on($("#tDownload"), "click", confirmTorrentDownload);
+  on($("#tAll"), "change", (e) => {
+    document.querySelectorAll('#tFiles input[type="checkbox"]').forEach((cb) => { cb.checked = e.target.checked; });
+    updateTorrentSelection();
+  });
+  on($("#tFiles"), "change", (e) => { if (e.target.matches('input[type="checkbox"]')) updateTorrentSelection(); });
+  if (driver.torrentAddFile) {
+    $("#torrentBtn").classList.remove("hidden");
+    const tc = $("#sTorrentCard");
+    if (tc) tc.classList.remove("hidden");
+    on($("#torrentBtn"), "click", () => $("#torrentFile").click());
+    on($("#torrentFile"), "change", (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (f) addTorrentFile(f);
+      e.target.value = "";
+    });
+  }
   on($("#go"), "click", () => analyze($("#url").value));
   on($("#url"), "keydown", (e) => { if (e.key === "Enter") analyze($("#url").value); });
   on($("#url"), "paste", (e) => {
@@ -949,6 +1152,7 @@ document.addEventListener("DOMContentLoaded", () => {
     on(b, "click", () => closeDlg(b.dataset.close)));
   window.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
+    if ($("#torrentSheet") && !$("#torrentSheet").classList.contains("hidden")) discardTorrentPick();
     document.querySelectorAll(".scrim").forEach((s) => s.classList.add("hidden"));
   });
 

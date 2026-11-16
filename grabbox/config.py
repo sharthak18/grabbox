@@ -17,6 +17,10 @@ DEFAULTS = {
     "watch_clipboard": False,
     "port": 8765,
     "open_browser": True,
+    # torrents (desktop only; the browser build ignores these)
+    "torrent_download_kbps": 0,
+    "torrent_upload_kbps": 0,
+    "torrent_seed_when_done": False,
 }
 
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".grabbox")
