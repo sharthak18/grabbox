@@ -225,6 +225,7 @@ class GrabViewModel : ViewModel() {
     fun setDir(path: String) {
         downloadDir = path
         File(path).mkdirs()
+        applyHorse() // persist the choice, like the horse settings
     }
 
     fun updateEngine(context: Context) {
